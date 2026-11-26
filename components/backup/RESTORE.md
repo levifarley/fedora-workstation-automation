@@ -45,6 +45,25 @@ Expect these manual follow-ups (the script lists them in its notes):
 - GNOME settings: `dconf load / < ~/.local/share/system-manifest/dconf-full.ini` from inside the desktop, then log out/in.
 - Go through `~/restore-etc-review.txt` (Wi-Fi, custom /etc changes) with Levi.
 - NVIDIA: `sudo dnf install akmod-nvidia xorg-x11-drv-nvidia-cuda` (from RPM Fusion), wait for the module to build, then reboot.
+- **deadman must be re-paired with the phone** (phase `deadman` installs the agent and prints the steps): a fresh install
+  has a new machine-id and a new order channel, so orders from the old `phone.conf` are rejected. `deadman phone-setup` →
+  new `phone.conf` on the phone → `deadman arm '<phone's deadman_ed25519.pub>'` → `deadman-order test` → ACCEPTED in
+  `deadman log`. Then at home: `deadman trust-here`. With LUKS in place, `wipe` is now a real crypto-erase.
+- **Docker is rootless** (phase `docker`). Never add levi to the `docker` group: that's passwordless root. Volumes from
+  `~/docker-export` are restored automatically; images come back with `docker compose up -d --build` per project.
+
+## Before wiping (the day of the reinstall)
+Claude runs a full systems check and gives the go-ahead first. Then:
+1. **Export Docker volumes** (`~/.local/share/docker` is excluded from the backup, so they'd be lost):
+   ```bash
+   mkdir -p ~/docker-export && for v in $(docker volume ls -q); do
+     docker run --rm -v "$v":/v -v ~/docker-export:/out alpine tar -C /v -cf "/out/$v.tar" .; done; ls -lh ~/docker-export
+   ```
+2. **Fresh backups:** `backup` (runs one now), plus the movies backup if the SSD changed; then `backup status` shows today.
+3. **Config history pushed:** `dots save`.
+4. **Off the laptop** (password manager / paper): restic password, Google OAuth client ID + secret, GitHub login,
+   Wi-Fi password, Tailscale login, alerts Gmail app password. The phone keeps its deadman key; nothing to do there.
+5. Phone: `deadman-order test` still works (proves the phone side is fine before re-pairing).
 
 ## Restore procedure
 Work step by step and confirm with Levi before overwriting anything in `/etc`.

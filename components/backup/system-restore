@@ -3,7 +3,7 @@
 # group: System care
 #   system-restore                 run every phase (each is skipped once done; safe to re-run after fixing a problem)
 #   system-restore --rehearsal     same, inside a throwaway VM: no NVIDIA/firmware, never writes to Drive/GitHub/phone
-#   system-restore --phase NAME    run one phase: tools stage repos packages home usrlocal flatpak installers services dconf etc verify
+#   system-restore --phase NAME    run one phase: tools stage repos packages home usrlocal flatpak installers deadman docker services dconf etc verify
 #   system-restore --list          show phases and which are done
 # Needs before starting: ~/.config/rclone/rclone.conf (Drive login) and ~/.config/backup/restic-password (from Levi).
 # Never overwrites /etc blindly: it writes a review report of every changed /etc file instead (phase "etc").
@@ -17,7 +17,7 @@ while [ $# -gt 0 ]; do
         -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0"; exit 0 ;;
     esac; shift
 done
-PHASES=(tools stage repos packages home usrlocal flatpak installers services dconf etc verify)
+PHASES=(tools stage repos packages home usrlocal flatpak installers deadman docker services dconf etc verify)
 STAGE=/var/tmp/restore-staging
 DONE="$HOME/.local/state/system-restore"; mkdir -p "$DONE"
 LOG="$HOME/system-restore.log"
@@ -147,6 +147,48 @@ ph_installers() {
         fi
     else note "couldn't install firewalld — the laptop firewall zone is NOT applied"; fi
     systemctl --user daemon-reload
+    true
+}
+
+ph_deadman() {
+    # Installs the agent only. Pairing with the phone is manual: a fresh install has a NEW machine-id and gets a NEW
+    # order channel, so the phone's old phone.conf would send orders this laptop rejects ("for another machine").
+    bash "$HOME/.config/deadman/install.sh" </dev/null 2>&1 | tee -a "$LOG" | tail -3 || note "deadman install reported a problem (see $LOG)"
+    if [ $REHEARSAL = 1 ]; then note "rehearsal: deadman agent installed, NOT paired (never pair a VM with the phone)"; return 0; fi
+    note "deadman: RE-PAIR THE PHONE. In a real terminal: deadman phone-setup → on the phone replace ~/.config/deadman/phone.conf (and re-copy ~/bin/deadman-order) → deadman arm '<line from: cat ~/.ssh/deadman_ed25519.pub on the phone>' → on the phone: ~/bin/deadman-order test → deadman log shows ACCEPTED"
+    note "deadman: at home, trust the router again: deadman trust-here. The disk is encrypted now, so 'wipe' is a real crypto-erase: update the deadman section of ~/Projects/fedora-workstation-automation/README.md"
+    true
+}
+
+ph_docker() {
+    # Docker is ROOTLESS on purpose. Never add levi to the docker group: that is passwordless root and bypasses the
+    # Claude guard and the deadman trust store (watcher test no-root-equivalent-access fails if it happens).
+    command -v dockerd-rootless-setuptool.sh >/dev/null ||
+        { note "docker: not installed — skipped (sudo dnf install docker-ce docker-ce-rootless-extras, then: system-restore --phase docker)"; return 0; }
+    if getent group docker | cut -d: -f4 | tr , '\n' | grep -qx "$USER"; then
+        note "docker: $USER is in the docker group — sudo gpasswd -d $USER docker, log out/in, then: system-restore --phase docker"; return 1
+    fi
+    sudo systemctl disable --now docker.service docker.socket 2>/dev/null; sudo rm -f /var/run/docker.sock
+    rm -f "$HOME/.config/systemd/user/docker.service"        # restored copy from the old system: let the tool write a fresh one
+    dockerd-rootless-setuptool.sh install 2>&1 | tee -a "$LOG" | tail -3
+    systemctl --user daemon-reload; systemctl --user enable --now docker
+    docker context use rootless >/dev/null 2>&1
+    sudo loginctl enable-linger "$USER"
+    docker info 2>/dev/null | grep -qi 'rootless' || { note "docker: rootless daemon didn't come up (systemctl --user status docker)"; return 1; }
+    echo "  rootless Docker running"
+    # project volumes exported right before the reinstall (RESTORE.md → "Before wiping")
+    local X="$HOME/docker-export" t v
+    if ls "$X"/*.tar >/dev/null 2>&1; then
+        for t in "$X"/*.tar; do
+            v=$(basename "$t" .tar)
+            if docker volume inspect "$v" >/dev/null 2>&1; then echo "  volume $v already exists"; continue; fi
+            docker volume create "$v" >/dev/null && docker run --rm -v "$v":/v -v "$X":/in:ro alpine tar -C /v -xf "/in/$v.tar" &&
+                echo "  restored volume $v ($(du -h "$t" | cut -f1))"
+        done
+        note "docker: volumes restored from ~/docker-export. Images: cd ~/Projects/<project> && docker compose up -d --build. Delete ~/docker-export once projects work."
+    else
+        note "docker: no ~/docker-export — project volumes (databases, Ollama models) start empty"
+    fi
     true
 }
 

@@ -119,15 +119,18 @@ flowchart LR
     C["🤖 Claude action"] --> AM{"Auto mode<br/>judges context"}
     AM -- risky --> ASK1["asks Levi"]
     AM -- ok --> GU{"🛡 claude-guard<br/>root-owned hook"}
-    GU -- "git · secrets · tamper · wipe" --> BLOCK["✘ blocked + email"]
-    GU -- "browser · send data · stop jobs · firewall" --> ASK2["? asks Levi + email"]
+    GU -- "git · secrets · tamper · wipe" --> BLOCK["✘ blocked"]
+    GU -- "browser · send data · stop jobs · firewall" --> ASK2["? asks Levi"]
+    BLOCK -- "serious only:<br/>tamper · deadman · secret · destroy" --> NOTE["🔔 desktop + 📧 email"]
     GU -- else --> RUN["✔ runs"]
     GU --> LOG[("journal<br/>claude-audit")]
     LOG --> WC["watcher claude"]
 ```
 
 - **Managed settings** (`/etc/claude-code/managed-settings.json`, root): the guard hook plus `allowManagedHooksOnly`. Nothing can override it.
-- **claude-guard** (`/usr/local/bin/claude-guard`, root): 48 self-tested decisions. It fails closed.
+- **claude-guard** (`/usr/local/bin/claude-guard`, root): 50 self-tested decisions. It fails closed.
+- **Notifications:** desktop + email only for serious blocks (tamper, deadman, secrets, disk destruction, guard errors). Routine blocks/asks (git, network, config edits) go to the journal only.
+- **No root-equivalent groups:** Docker is rootless (the `docker` group was passwordless root and bypassed all of the above). Test `no-root-equivalent-access` enforces it.
 - **Audit log:** the system journal, tag `claude-audit`. Claude can read it but can't edit it.
 - **Pause:** only Levi, with sudo in a real terminal (`watcher guard pause`). Logging continues and the pause expires on its own.
 - **Tests** check nightly that the guard is installed, root-owned, unmodified, deciding correctly and actually logging.
@@ -156,6 +159,7 @@ sequenceDiagram
 
 - **SSH:** keys only, `levi` only, no forwarding (so the phone's keys can never be used from the laptop), Tailscale only. Verified from `sshd -T`.
 - **deadman:** the laptop holds only the **public** key, so nothing on it, Claude included, can forge an order. Actions: `test` · `locate` · `lost`/`found` · `lock`/`unlock` · `scrub` · `wipe`.
+- **Away alert:** every 2-min check identifies the network by its router's MAC. On anything but the trusted home router it sends a high-priority email (location, who's logged in, the exact phone orders). `deadman trust-here` · `deadman away pause 3d`. Tested on a phone hotspot 2026-11-25.
 
 ---
 
@@ -178,7 +182,9 @@ sequenceDiagram
 | Claude guard | `watcher claude` · `watcher guard` | `claude-guard/` | `/usr/local/bin/claude-guard` | (tests) |
 | Remote access | `remote` · `watcher remote` | `remote/` | sshd drop-in, Tailscale, firewalld `tailnet` | (tests) |
 | Remote wipe | `deadman` · `/deadman` | `deadman/` | `/usr/local/bin/deadman-agent` | deadman |
-| Alerts | `watcher alerts` | `watcher/alerts.conf` | `/usr/local/bin/watcher-alert` | (all) |
+| Alerts | `watcher alerts [test\|setup]` | `watcher/alerts.conf` | `/usr/local/bin/watcher-alert` (Gmail SMTP, separate alerts account) | (all) |
+| Docker | `docker` (rootless) | (none) | `systemctl --user docker`, data in `~/.local/share/docker` | (tests) |
+| Showcase | `tools/sync.sh` | `~/Projects/fedora-workstation-automation` | public GitHub repo (redacted copy) | (none) |
 | DVD tools | `ripit` · `ripdvd` · `burnit` · `mkdvdiso` · `/ripit` · `/burnit` | (scripts) | `~/.local/bin` | (none) |
 | Terminal | `ll` · `cat` (bat) · `h` · `tailf` | `~/.bashrc.d/` | (shell) | (none) |
 | Claude usage | `claude-usage-today` | (script) | `~/.local/bin` | (none) |
@@ -196,12 +202,13 @@ sequenceDiagram
 | Configs + scripts | `~/.config`, `~/.local/bin` | GitHub (dots) · Drive · snapshots |
 | Secrets (backup password, Drive/GitHub logins, keys) | root/600 files, never in git | password manager (off-device) |
 | Claude activity | system journal | (n/a) |
+| Docker images + volumes | `~/.local/share/docker` (rootless) | **not backed up**: images rebuild; export volumes to `~/docker-export` before a reinstall |
 
 ---
 
 ## 8. Roadmap
 
-- [ ] **Email alerts, option 2:** a separate alerts Gmail + msmtp (ntfy no longer forwards email anonymously)
+- [x] **Email alerts, option 2:** a separate alerts Gmail, sent over SMTP with curl (ntfy no longer forwards email anonymously)
 - [ ] **Encrypted reinstall** (weekend 2026-11-28/29) using `system-restore`
 - [ ] **deadman:** a real crypto-erase wipe once LUKS is in place; test the full chain
 - [ ] **Sandbox mode** for Claude Code (OS-level limits on top of the guard)
@@ -214,4 +221,4 @@ sequenceDiagram
 | Date | Change |
 |---|---|
 | 2026-11-24 | Terminal colors, Zed tweaks · restic → Google Drive backup · NVIDIA-safe nightly update · Flatpaks → RPMs · VS Code, Déjà Dup, Proton VPN removed · `watcher` overseer · btrfs snapshots · disk-health · test suite · pause · nightly verify + fixer · `watcher commands` · dots/GitHub · tight firewall zone · Claude guard |
-| 2026-11-25 | Movie backup to Drive (150 GiB) · `system-restore` + VM rehearsal (passed) · guard pause · phone access (Tailscale, `ssh system`, Claude in tmux) · `deadman` remote lock/locate/wipe · central email alerts · `/dots` · this document |
+| 2026-11-25 | Movie backup to Drive (150 GiB) · `system-restore` + VM rehearsal (passed) · guard pause · phone access (Tailscale, `ssh system`, Claude in tmux) · `deadman` remote lock/locate/wipe · central email alerts · `/dots` · this document · deadman away-from-home alert (router-MAC trust) · guard notifies on serious blocks only · rootless Docker (closed a root-equivalent `docker` group) · alerts via a separate Gmail over SMTP · `system-restore` phases `deadman` + `docker` and a "Before wiping" checklist · public showcase repo |

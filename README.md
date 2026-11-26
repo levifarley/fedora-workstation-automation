@@ -115,7 +115,7 @@ building this repo (below). `ask` hands the decision to me in the normal approva
 | **Fail closed** | If the guard crashes or gets input it can't parse, the action is **denied**. A broken guard blocks things; it never lets everything through. |
 | **Audit log** | Every action, including allowed ones, is written to the system journal (`claude-audit`). Journal files are root-owned, so the agent can read the log but can't edit or delete it. `watcher claude` summarises sessions, blocked/asked events and browser URLs. |
 | **Pause** | Sometimes I want it out of the way. `watcher guard pause 2h` writes an expiry time to a root-owned file (sudo, my terminal only). While paused, blocks/asks become log entries **but tamper rules stay on and everything is still logged**, and the pause **expires by itself**. A pause file that isn't root-owned is ignored. |
-| **Tests** | A self-test with 48 sample actions and their expected verdicts, plus 8 checks of which blocks notify. The nightly watcher suite also checks that the installed guard is root-owned, identical to the reviewed source, passing its self-test and actually logging. |
+| **Tests** | A self-test with 50 sample actions and their expected verdicts, plus 8 checks of which blocks notify. The nightly watcher suite also checks that the installed guard is root-owned, identical to the reviewed source, passing its self-test and actually logging. |
 
 ### What it decides
 
@@ -203,7 +203,7 @@ the agent:
   whole design: the agent runs as an unprivileged user; the guard, its config and the log belong to root.
 - **"What if the guard breaks?"** It fails closed, so the agent loses access instead of gaining it. A self-test
   gates installation, and nightly tests check it's still in place.
-- **"How do you know it works?"** 48 table-driven decision tests, nightly integrity checks, and the audit log
+- **"How do you know it works?"** 50 table-driven decision tests, nightly integrity checks, and the audit log
   shows real denials in daily use.
 - **"How would you get around it?"** Indirection through files, anything the same Unix user can already read,
   or a root-equivalent group. I found and closed one of those (`docker` → rootless Docker, now tested nightly). That's why the roadmap item is a kernel-enforced sandbox, and why
@@ -251,6 +251,10 @@ automation shows up in `watcher` by itself. `watcher check` exits non-zero on fa
 failed units or a pending reboot; `watcher fix` applies safe repairs (root-level fixes are written as a script I
 approve). The test suite (`watcher test`) covers backups, restores, snapshots, firewall, SSH hardening, the guard
 and deadman.
+
+All alerts leave through one root-owned sender, `watcher-alert`. It emails over Gmail SMTP from a **separate,
+throwaway alerts account**: the only credential on the laptop is that account's app password, which can send mail and
+do nothing else, so stealing it gains almost nothing. Deadman mails and guard blocks are sent as high priority.
 
 ---
 

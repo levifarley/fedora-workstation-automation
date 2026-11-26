@@ -32,7 +32,7 @@ for name in "${!PATTERNS[@]}"; do
     if [ -n "$hits" ]; then bad=1; echo "✘ $name in:"; sed 's/^/     /' <<<"$hits"; fi
 done
 
-for f in alerts.conf ntfy-topic restic-password healthchecks-url rclone.conf phone-key.pub; do
+for f in alerts.conf ntfy-topic restic-password healthchecks-url smtp-netrc rclone.conf phone-key.pub; do
     found=$(find . -name "$f" -not -path './.git/*')
     [ -n "$found" ] && { bad=1; echo "✘ file that must never be published: $found"; }
 done

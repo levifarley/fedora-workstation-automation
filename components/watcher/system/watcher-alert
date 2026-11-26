@@ -1,21 +1,48 @@
 #!/bin/bash
 # /usr/local/bin/watcher-alert "<title>" "<body>" — the one place every alert goes out (failures, guard, approvals, reports, deadman).
-# Config: ~levi/.config/watcher/alerts.conf (METHOD, EMAIL). Today: email via ntfy.sh forwarding (no mail password on this laptop).
+# Config: ~levi/.config/watcher/alerts.conf  (set up with: watcher alerts setup)
+#   METHOD=smtp-gmail  EMAIL=<where alerts go>  FROM=<the separate alerts Gmail>
+#     login: ~levi/.config/watcher/smtp-netrc (mode 600; a Gmail APP password for the alerts account only —
+#     it can send mail as that throwaway account and nothing else). Sent with curl over TLS (smtps, port 465).
+#   METHOD=ntfy-email  (legacy: ntfy.sh stopped forwarding email for anonymous users — HTTP 400)
+#   METHOD=none
 # Only the title and a short body are sent — never file contents or commands.
+# deadman mails and guard blocks go out as HIGH priority (X-Priority 1 / Importance: high).
 U="${ALERT_USER:-levi}"; H=$(getent passwd "$U" | cut -d: -f6)
 title="[system] ${1:-alert}"; body="$(hostname): ${2:-}"
-conf="$H/.config/watcher/alerts.conf"; topicf="$H/.config/watcher/ntfy-topic"
-METHOD=ntfy-email; EMAIL=""
-[ -r "$conf" ] && eval "$(grep -E '^(METHOD|EMAIL)=[A-Za-z0-9@._+-]+$' "$conf")"
-topic=$(head -c 80 "$topicf" 2>/dev/null | tr -dc 'A-Za-z0-9_-')
+conf="$H/.config/watcher/alerts.conf"; topicf="$H/.config/watcher/ntfy-topic"; netrc="$H/.config/watcher/smtp-netrc"
+METHOD=ntfy-email; EMAIL=""; FROM=""
+[ -r "$conf" ] && eval "$(grep -E '^(METHOD|EMAIL|FROM)=[A-Za-z0-9@._+-]+$' "$conf")"
 logger -t watcher-alert -- "$title — $body"
+addr='^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+fail() { echo "watcher-alert: $*"; logger -t watcher-alert -- "send failed: $*"; exit 1; }
+
 case "$METHOD" in
+    smtp-gmail)
+        [[ "$EMAIL" =~ $addr ]] && [[ "$FROM" =~ $addr ]] || fail "EMAIL/FROM not set in $conf (watcher alerts setup)"
+        [ -r "$netrc" ] || fail "no login file $netrc (watcher alerts setup)"
+        prio=""
+        [[ "${1:-}" =~ ^deadman|blocked ]] && prio=$'X-Priority: 1 (Highest)\nImportance: high\n'
+        msg=$(mktemp) || fail "mktemp"; trap 'rm -f "$msg"' EXIT; chmod 600 "$msg"
+        {
+            printf 'From: "System Alerts" <%s>\n' "$FROM"
+            printf 'To: <%s>\n' "$EMAIL"
+            printf 'Subject: =?UTF-8?B?%s?=\n' "$(printf '%s' "$title" | base64 -w0)"
+            printf 'Date: %s\n' "$(LC_ALL=C date -R)"
+            printf 'Message-ID: <%s.%s@%s>\n' "$(date +%s)" "$RANDOM$RANDOM" "$(hostname)"
+            printf '%s' "$prio"
+            printf 'MIME-Version: 1.0\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\n'
+            printf '%s\n' "$body"
+        } >"$msg"
+        err=$(curl -sS -m 60 --retry 2 --ssl-reqd --crlf --url "smtps://smtp.gmail.com:465" --netrc-file "$netrc" \
+                   --mail-from "$FROM" --mail-rcpt "$EMAIL" --upload-file "$msg" 2>&1) || fail "SMTP: $(head -c 300 <<<"$err")" ;;
     ntfy-email)
-        [ -n "$topic" ] && [[ "$EMAIL" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$ ]] || { echo "watcher-alert: no email/topic configured"; exit 1; }
+        topic=$(head -c 80 "$topicf" 2>/dev/null | tr -dc 'A-Za-z0-9_-')
+        [ -n "$topic" ] && [[ "$EMAIL" =~ $addr ]] || fail "no email/topic configured"
         resp=$(curl -sS -m 20 --retry 3 -w '\n%{http_code}' -H "Title: $title" -H "X-Email: $EMAIL" -H "Tags: computer" \
-             --data-binary "$body" "https://ntfy.sh/$topic") || { echo "watcher-alert: network error"; exit 1; }
+             --data-binary "$body" "https://ntfy.sh/$topic") || fail "network error"
         code=${resp##*$'\n'}
-        [ "$code" = 200 ] || { echo "watcher-alert: ntfy.sh said HTTP $code: $(head -c 300 <<<"${resp%$'\n'*}")"; logger -t watcher-alert -- "send failed: HTTP $code"; exit 1; } ;;
+        [ "$code" = 200 ] || fail "ntfy.sh said HTTP $code: $(head -c 300 <<<"${resp%$'\n'*}")" ;;
     none) ;;
-    *) echo "watcher-alert: unknown METHOD $METHOD"; exit 1 ;;
+    *) fail "unknown METHOD $METHOD" ;;
 esac

@@ -412,7 +412,8 @@ def no_login_attack_signs():
 @test("security")
 def secrets_private():
     paths = [f"{HOME}/.config/backup/restic-password", f"{HOME}/.config/rclone/rclone.conf",
-             f"{HOME}/.config/watcher/ntfy-topic", f"{HOME}/.config/watcher/healthchecks-url"]
+             f"{HOME}/.config/watcher/ntfy-topic", f"{HOME}/.config/watcher/healthchecks-url",
+             f"{HOME}/.config/watcher/smtp-netrc"]
     bad = [p for p in paths if os.path.exists(p) and os.stat(p).st_mode & 0o077]
     return ok(not bad, f"readable by other users: {bad} — chmod 600", "backup/Drive/alert secrets are mode 600")
 
@@ -421,7 +422,7 @@ def dotfiles_no_secrets():
     gd = f"{HOME}/.dotfiles"
     if not os.path.isdir(gd): raise Skip("dots repo not set up")
     files = run(["git", f"--git-dir={gd}", f"--work-tree={HOME}", "ls-files"], cwd=HOME).stdout.splitlines()
-    bad = [f for f in files if re.search(r"restic-password|ntfy-topic|healthchecks-url|rclone\.conf|\.ssh/", f)]
+    bad = [f for f in files if re.search(r"restic-password|ntfy-topic|healthchecks-url|smtp-netrc|rclone\.conf|\.ssh/", f)]
     return ok(not bad, f"secret files are tracked in ~/.dotfiles: {bad}", f"{len(files)} tracked files, no secrets")
 
 @test("security")

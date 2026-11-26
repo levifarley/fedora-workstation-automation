@@ -23,6 +23,8 @@ CASES = [
     (B("dots save 'x'"), "deny"),
     (B("cat ~/.config/backup/restic-password"), "deny"),
     (B("cat ~/.config/rclone/rclone.conf"), "deny"),
+    (B("cat ~/.config/watcher/smtp-netrc"), "deny"),
+    ({"tool_name": "Read", "tool_input": {"file_path": "/home/levi/.config/watcher/smtp-netrc"}}, "deny"),
     ({"tool_name": "Read", "tool_input": {"file_path": "/home/levi/.ssh/id_ed25519"}}, "deny"),
     (B("sudo rm /etc/claude-code/managed-settings.json"), "deny"),
     (B("cat /etc/claude-code/managed-settings.json 2>/dev/null"), "log"),

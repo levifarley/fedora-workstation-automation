@@ -34,7 +34,7 @@ def paused_until():
         return None
 
 SECRETS = [
-    r"restic-password", r"\.config/rclone", r"rclone\.conf", r"ntfy-topic", r"healthchecks-url",
+    r"restic-password", r"\.config/rclone", r"rclone\.conf", r"ntfy-topic", r"healthchecks-url", r"smtp-netrc",
     r"\.ssh/id_", r"\.ssh/.*key", r"\.gnupg/private", r"keyrings/", r"\.dotfiles",
     r"google-chrome/[^ ]*(Login Data|Cookies|Web Data)", r"\.mozilla/.*(logins\.json|key4\.db|cookies)",
     r"\.claude/\.credentials", r"\.config/gh/hosts\.yml",

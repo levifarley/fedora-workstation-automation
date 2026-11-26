@@ -2,6 +2,7 @@
 .config/backup/restic-password
 .config/watcher/ntfy-topic
 .config/watcher/healthchecks-url
+.config/watcher/smtp-netrc
 .config/rclone/
 .ssh/
 *.key

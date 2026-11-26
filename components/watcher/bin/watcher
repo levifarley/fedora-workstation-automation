@@ -24,7 +24,7 @@ usage:
   watcher report [--notify]  weekly summary: nights, jobs, backup growth, disk wear, tests, firmware (auto: Sun 13:00)
   watcher claude [today|week] [--all]   what Claude Code did: sessions, actions, blocked/asked events, browser URLs
   watcher guard [status|pause [30m|2h]|resume]   pause the Claude guard (sudo, your terminal only; still logs; auto-expires)
-  watcher alerts [test]      email alert settings; `alerts test` sends a test email
+  watcher alerts [test|setup]   email alert settings; `alerts test` sends a test email; `alerts setup` (you) sets the alerts Gmail
   watcher deadman ...        remote wipe / lock / locate (same as the deadman command)
   watcher remote ...         phone access status (same as the remote command)
   watcher logs <job> [-n N] [-f]
@@ -469,18 +469,48 @@ def send_alert(title, body):
     return subprocess.run([ALERT, title, body], capture_output=True).returncode == 0
 
 
+def alerts_setup(conf, cfg):
+    """Interactive: alerts Gmail (sender) + app password + where alerts go. Levi runs this; the password is typed hidden."""
+    import getpass
+    if not sys.stdin.isatty(): print("Run this yourself in a terminal: watcher alerts setup"); return 1
+    addr = re.compile(r"^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+    ask = lambda q, d="": (input(f"{q}{f' [{d}]' if d else ''}: ").strip() or d)
+    print(c(BOLD, "Email alerts via a separate Gmail account") + c(DIM, "  (needs 2-Step Verification + an app password on THAT account)"))
+    frm = ask("Alerts Gmail address (sends the alerts)", cfg.get("FROM", ""))
+    to = ask("Where alerts should go (your main email)", cfg.get("EMAIL", ""))
+    if not (addr.match(frm) and addr.match(to)): print(c(RED, "✘ that doesn't look like an email address")); return 1
+    pw = getpass.getpass("App password for the alerts account (16 letters, spaces ok; hidden): ").replace(" ", "")
+    if not re.fullmatch(r"[A-Za-z]{16}", pw): print(c(RED, "✘ an app password is 16 letters (myaccount.google.com/apppasswords)")); return 1
+    netrc = f"{HOME}/.config/watcher/smtp-netrc"
+    fd = os.open(netrc, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: f.write(f"machine smtp.gmail.com login {frm} password {pw}\n")
+    os.chmod(netrc, 0o600)
+    with open(conf, "w") as f:
+        f.write("# Where watcher alerts go (read by /usr/local/bin/watcher-alert). Subjects start with [system] for Gmail filters.\n"
+                f"# Change with: watcher alerts setup. Login: ~/.config/watcher/smtp-netrc (600, never in git)\n"
+                f"METHOD=smtp-gmail\nEMAIL={to}\nFROM={frm}\n")
+    print(c(GRN, "✔ saved") + " — sending a test email…")
+    cmd_alerts(["test"])
+
+
 def cmd_alerts(args):
     conf = f"{HOME}/.config/watcher/alerts.conf"
     cfg = dict(l.strip().split("=", 1) for l in open(conf) if "=" in l and not l.startswith("#")) if os.path.exists(conf) else {}
+    if args[:1] == ["setup"]:
+        return alerts_setup(conf, cfg)
     if args[:1] == ["test"]:
         subprocess.run(["notify-send", "-a", "Watcher", "Watcher test", "Desktop notifications work"])
-        ok_ = send_alert("Watcher test", "Email alerts work. Filter on [system] in the subject.")
-        print(c(GRN, f"✔ test email sent to {cfg.get('EMAIL', '?')} (arrives in a minute or two)") if ok_
-              else c(RED, "✘ email failed — is ~/.config/watcher/install.sh installed?"))
+        r = subprocess.run([ALERT, "Watcher test", "Email alerts work. Filter on [system] in the subject."],
+                           capture_output=True, text=True) if os.path.exists(ALERT) else None
+        if r is not None and r.returncode == 0:
+            print(c(GRN, f"✔ test email sent to {cfg.get('EMAIL', '?')} (arrives in a minute or two)"))
+        else:
+            print(c(RED, "✘ email failed: " + (r.stdout.strip() if r else "watcher-alert not installed (~/.config/watcher/install.sh)")))
         return
     print(c(BOLD, "Desktop") + ": GNOME notifications (always on)")
-    print(c(BOLD, "Email") + f": {cfg.get('EMAIL', 'not set')} via {cfg.get('METHOD', '?')}  " + c(DIM, "(subjects start with [system])"))
-    print(c(DIM, "   test: watcher alerts test · change: ~/.config/watcher/alerts.conf"))
+    via = cfg.get("METHOD", "?") + (f" from {cfg['FROM']}" if cfg.get("FROM") else "")
+    print(c(BOLD, "Email") + f": {cfg.get('EMAIL', 'not set')} via {via}  " + c(DIM, "(subjects start with [system])"))
+    print(c(DIM, "   test: watcher alerts test · set up / change: watcher alerts setup"))
     print(c(BOLD, "Remote wipe / locate") + ": deadman status")
 
 
