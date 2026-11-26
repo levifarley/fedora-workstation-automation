@@ -1,0 +1,21 @@
+#!/bin/bash
+# /usr/local/bin/watcher-alert "<title>" "<body>" — the one place every alert goes out (failures, guard, approvals, reports, deadman).
+# Config: ~levi/.config/watcher/alerts.conf (METHOD, EMAIL). Today: email via ntfy.sh forwarding (no mail password on this laptop).
+# Only the title and a short body are sent — never file contents or commands.
+U="${ALERT_USER:-levi}"; H=$(getent passwd "$U" | cut -d: -f6)
+title="[system] ${1:-alert}"; body="$(hostname): ${2:-}"
+conf="$H/.config/watcher/alerts.conf"; topicf="$H/.config/watcher/ntfy-topic"
+METHOD=ntfy-email; EMAIL=""
+[ -r "$conf" ] && eval "$(grep -E '^(METHOD|EMAIL)=[A-Za-z0-9@._+-]+$' "$conf")"
+topic=$(head -c 80 "$topicf" 2>/dev/null | tr -dc 'A-Za-z0-9_-')
+logger -t watcher-alert -- "$title — $body"
+case "$METHOD" in
+    ntfy-email)
+        [ -n "$topic" ] && [[ "$EMAIL" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+$ ]] || { echo "watcher-alert: no email/topic configured"; exit 1; }
+        resp=$(curl -sS -m 20 --retry 3 -w '\n%{http_code}' -H "Title: $title" -H "X-Email: $EMAIL" -H "Tags: computer" \
+             --data-binary "$body" "https://ntfy.sh/$topic") || { echo "watcher-alert: network error"; exit 1; }
+        code=${resp##*$'\n'}
+        [ "$code" = 200 ] || { echo "watcher-alert: ntfy.sh said HTTP $code: $(head -c 300 <<<"${resp%$'\n'*}")"; logger -t watcher-alert -- "send failed: HTTP $code"; exit 1; } ;;
+    none) ;;
+    *) echo "watcher-alert: unknown METHOD $METHOD"; exit 1 ;;
+esac

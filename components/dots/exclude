@@ -1,0 +1,13 @@
+# never committed by dots (secrets + noise)
+.config/backup/restic-password
+.config/watcher/ntfy-topic
+.config/watcher/healthchecks-url
+.config/rclone/
+.ssh/
+*.key
+*.pem
+__pycache__/
+*.pyc
+# skills synced from claude.ai (managed by the app, not part of this setup) + its trash
+.claude/skills/synced/
+.claude/skills/.trash/

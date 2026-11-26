@@ -1,0 +1,781 @@
+#!/usr/bin/python3 -I
+"""watcher — one place to see and manage all of Levi's automation.
+group: System care
+
+Jobs are discovered automatically: any systemd unit (system or user) — or a drop-in <unit>.service.d/*.conf
+for units owned by packages — whose [Unit] section has
+  X-Watcher-Name=<short name>
+is a watched job. Optional keys:
+  X-Watcher-State=<file>        first line shown as the job's latest summary (FAILED/WARN in it = problem)
+  X-Watcher-MaxAge=36h          `watcher check` flags it if there was no successful run within this window
+  X-Watcher-Schedule=<text>     schedule text for jobs started by another job (e.g. "nightly, step 1")
+  X-Watcher-Notify=children     job has no OnFailure of its own on purpose (its sub-jobs notify)
+  X-Watcher-SuccessFile=<file>  epoch of the last real success (used for MaxAge instead of the journal)
+  X-Watcher-Rerun=no            the fixer never re-runs it automatically
+Add OnFailure=watcher-notify@%n.service to get a desktop notification when it fails.
+
+usage:
+  watcher                    dashboard of every watched job
+  watcher check              health check (failed/stale/disabled jobs, failed tests, failed units, reboot pending); exit 1 if problems
+  watcher test [--full] [group...]   end-to-end tests: does everything actually WORK (list | report for more)
+  watcher fix [--dry-run]    repair what's broken (user-level fixes now; root fixes → sudo script you approve), then test + check
+  watcher pause [job|all] [30m|2h|1d|until 08:00]   skip scheduled runs (default: all, until `watcher resume`)
+  watcher resume [job|all]   un-pause; lists runs that were skipped so you can run them
+  watcher report [--notify]  weekly summary: nights, jobs, backup growth, disk wear, tests, firmware (auto: Sun 13:00)
+  watcher claude [today|week] [--all]   what Claude Code did: sessions, actions, blocked/asked events, browser URLs
+  watcher guard [status|pause [30m|2h]|resume]   pause the Claude guard (sudo, your terminal only; still logs; auto-expires)
+  watcher alerts [test]      email alert settings; `alerts test` sends a test email
+  watcher deadman ...        remote wipe / lock / locate (same as the deadman command)
+  watcher remote ...         phone access status (same as the remote command)
+  watcher logs <job> [-n N] [-f]
+  watcher run <job>          start it now and stream its log
+  watcher info <job>         unit files, trigger, scripts, state
+  watcher enable|disable <job>   turn the job's timer/path trigger on/off (system jobs use sudo)
+  watcher commands [name]    every custom command, shell shortcut and Claude skill, grouped (name = full usage)
+"""
+import glob, json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+TTY = sys.stdout.isatty()
+def c(code, s): return f"\033[{code}m{s}\033[0m" if TTY else s
+BOLD, DIM, RED, GRN, YEL, CYN, MAG = "1", "2", "31", "32", "33", "36", "35"
+
+SCAN = [("system", "/etc/systemd/system"), ("user", f"{HOME}/.config/systemd/user")]
+
+
+def sh(args, check=False):
+    r = subprocess.run(args, capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 or not check else ""
+
+
+def sysctl(scope): return ["systemctl"] + (["--user"] if scope == "user" else [])
+def jctl(scope): return ["journalctl"] + (["--user"] if scope == "user" else [])
+
+
+def parse_dur(s):
+    m = re.fullmatch(r"(\d+)\s*([smhd])", s.strip())
+    return int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]] if m else None
+
+
+def ago(ts):
+    if not ts: return "—"
+    d = int(time.time() - ts)
+    fut = d < 0; d = abs(d)
+    s = (f"{d}s" if d < 60 else f"{d//60}m" if d < 3600 else f"{d//3600}h{(d%3600)//60:02d}m" if d < 86400 else f"{d//86400}d{(d%86400)//3600}h")
+    return f"in {s}" if fut else f"{s} ago"
+
+
+def dur(sec):
+    if sec is None: return ""
+    sec = int(sec)
+    return f"{sec}s" if sec < 60 else f"{sec//60}m{sec%60:02d}s" if sec < 3600 else f"{sec//3600}h{(sec%3600)//60:02d}m"
+
+
+def discover():
+    jobs = []
+    for scope, d in SCAN:
+        # own unit files, plus drop-ins (<unit>.service.d/*.conf) to watch units owned by packages
+        for f in sorted(glob.glob(f"{d}/*.service") + glob.glob(f"{d}/*.service.d/*.conf")):
+            if os.path.islink(f) or "@" in os.path.basename(f): continue
+            try: text = open(f).read()
+            except OSError: continue
+            keys = dict(re.findall(r"^X-Watcher-(\w+)\s*=\s*(.*?)\s*$", text, re.M))
+            if "Name" not in keys: continue
+            unit = os.path.basename(os.path.dirname(f))[:-2] if f.endswith(".conf") else os.path.basename(f)
+            desc = re.search(r"^Description\s*=\s*(.*)$", text, re.M)
+            gate = re.search(r"watcher-gate (\S+)", text)
+            if not desc:
+                d_ = sh(sysctl(scope) + ["show", unit, "-pDescription", "--value"]).strip()
+            jobs.append({
+                "name": keys["Name"], "scope": scope, "unit": unit, "file": f,
+                "desc": desc[1] if desc else d_,
+                "state": os.path.expanduser(keys["State"]) if "State" in keys else None,
+                "maxage": parse_dur(keys.get("MaxAge", "")),
+                "success_file": keys.get("SuccessFile"),
+                "schedule": keys.get("Schedule"),
+                "onfailure": "watcher-notify@" in text or "Notify" in keys,
+                "gate": gate[1] if gate else None,
+            })
+    for j in jobs:   # backup/update/verify run inside nightly, so nightly's pause applies to them
+        if not j["gate"] and (j.get("schedule") or "").startswith("nightly"): j["gate"] = "nightly"
+    return jobs
+
+
+def show(scope, unit, *props):
+    out = sh(sysctl(scope) + ["show", unit] + [f"-p{p}" for p in props])
+    return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+
+
+def ts_from_show(v):
+    if not v or v in ("n/a", "0"): return None
+    try:
+        return int(subprocess.run(["date", "-d", v, "+%s"], capture_output=True, text=True).stdout.strip())
+    except ValueError:
+        return None
+
+
+def runs(job, n=10):
+    """Recent runs from the journal: list of dicts {start, end, result} newest first."""
+    out = sh(jctl(job["scope"]) + ["-u", job["unit"], "JOB_TYPE=start", "-o", "json", "-n", str(n * 2), "-r", "--no-pager"])
+    ev = []
+    for l in out.splitlines():
+        try: e = json.loads(l)
+        except ValueError: continue
+        ev.append((int(e["__REALTIME_TIMESTAMP"]) / 1e6, e.get("JOB_RESULT")))
+    res, pending_end = [], None
+    for t, r in ev:  # newest first
+        if r:
+            if pending_end: res.append({"start": None, **pending_end})
+            pending_end = {"end": t, "result": r}
+        else:
+            if pending_end: res.append({"start": t, **pending_end}); pending_end = None
+            elif not res: res.append({"start": t, "end": None, "result": "running"})
+    if pending_end: res.append({"start": None, **pending_end})
+    return res
+
+
+def last_success(job):
+    if job.get("success_file"):   # job decides what counts as success (e.g. "SSD not plugged in" doesn't)
+        try: return float(open(job["success_file"]).read().strip())
+        except (OSError, ValueError): return None
+    out = sh(jctl(job["scope"]) + ["-u", job["unit"], "JOB_RESULT=done", "-o", "json", "-n", "20", "-r", "--no-pager"])
+    for l in out.splitlines():
+        try: t = int(json.loads(l)["__REALTIME_TIMESTAMP"]) / 1e6
+        except (ValueError, KeyError): continue
+        if not was_skip(job, t): return t
+    return None
+
+
+def trigger(job):
+    """(trigger_unit, schedule_text, next_ts, active?, enabled?)"""
+    tb = show(job["scope"], job["unit"], "TriggeredBy").get("TriggeredBy", "").split()
+    for t in tb:
+        p = show(job["scope"], t, "ActiveState", "UnitFileState", "NextElapseUSecRealtime", "TimersCalendar", "Paths")
+        if t.endswith(".timer"):
+            m = re.search(r"OnCalendar=([^;]+?)\s*;", p.get("TimersCalendar", ""))
+            sched = m[1] if m else "timer"
+            m2 = re.fullmatch(r"(?:(\w{3}) )?\*-\*-\* (\d\d:\d\d):00", sched)
+            if m2: sched = f"weekly {m2[1]} {m2[2]}" if m2[1] else f"daily {m2[2]}"
+            elif sched == "*-*-* *:00:00": sched = "hourly"
+            elif sched == "timer":
+                mono = sh(sysctl(job["scope"]) + ["show", t, "-pTimersMonotonic"])
+                mm = re.search(r"OnUnitActiveUSec=([^;]+?)\s*;", mono)
+                sched = f"every {mm[1].strip()}" if mm else "timer"
+            nxt = ts_from_show(p.get("NextElapseUSecRealtime"))
+        else:
+            m = re.match(r"(.*?)\s*\((\w+)\)\s*$", p.get("Paths", ""))
+            sched = f"when {m[1]} changes" if m else "path"
+            nxt = None
+        return t, sched, nxt, p.get("ActiveState") == "active", p.get("UnitFileState") in ("enabled", "static", "linked")
+    return None, job.get("schedule") or "manual", None, True, True
+
+
+def state_line(job):
+    if not job["state"]: return None
+    try:
+        with open(job["state"]) as f: return f.readline().strip()
+    except OSError: return None
+
+
+PAUSE = f"{HOME}/.local/state/watcher/paused"
+SKIPS = f"{HOME}/.local/state/watcher/skipped"
+
+
+def pause_of(job):
+    """(paused?, until_epoch or None for indefinite, marker name, set_at) for a job (its gate name or 'all')."""
+    for n in [job.get("gate") or job["name"], "all"] if job.get("gate") else []:
+        f = f"{PAUSE}/{n}"
+        try: v = open(f).read().strip()
+        except OSError: continue
+        if v in ("indefinite", "disabled"): return True, None, n, os.path.getmtime(f)
+        if v.isdigit() and int(v) > time.time(): return True, int(v), n, os.path.getmtime(f)
+    return False, None, None, None
+
+
+def skip_times(job):
+    try: return [ts_from_iso(l) for l in open(f"{SKIPS}/{job.get('gate') or job['name']}").read().split()]
+    except OSError: return []
+
+
+def ts_from_iso(v):
+    try: return time.mktime(time.strptime(v[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError: return 0
+
+
+def was_skip(job, t):
+    return t is not None and any(abs(t - s) < 30 for s in skip_times(job))
+
+
+def until_text(u): return "until resumed" if u is None else time.strftime("until %a %H:%M", time.localtime(u))
+
+
+def state_details(job):
+    """'  - note' lines after the first line of a state file (failed tests, warnings)."""
+    if not job["state"] or not os.path.exists(job["state"]): return []
+    return [l.strip()[2:] for l in open(job["state"]).read().splitlines()[1:] if l.strip().startswith("- ")][:8]
+
+
+def find(jobs, key):
+    key = key.removesuffix(".service")
+    for j in jobs:
+        if key in (j["name"], j["unit"].removesuffix(".service")): return j
+    sys.exit(f"no watched job named '{key}'. Jobs: {', '.join(j['name'] for j in jobs)}")
+
+
+def summarize_state(s):
+    if not s: return ""
+    s = re.sub(r"^\d{4}-\d\d-\d\dT[\d:]+[-+]\d\d:?\d\d\s*", "", s)  # drop leading ISO timestamp
+    return s
+
+
+# ---------------------------------------------------------------- commands
+def ordered(jobs):
+    def key(j):
+        sch = j.get("schedule") or ""
+        if j["name"] == "nightly": return ("0", 0, "")
+        if sch.startswith("nightly"): return ("0", 1, sch)
+        return ("1", 0, j["name"])
+    return sorted(jobs, key=key)
+
+
+def cmd_dashboard(jobs):
+    jobs = ordered(jobs)
+    print(c(BOLD, "Automation") + c(DIM, f"  ({len(jobs)} watched jobs · watcher check · watcher fix · watcher pause · watcher help)"))
+    print()
+    rows = []
+    for j in jobs:
+        tu, sched, nxt, active, enabled = trigger(j)
+        r = runs(j, 1)
+        last = r[0] if r else None
+        if j["name"] != "nightly" and j.get("schedule", "") and j["schedule"].startswith("nightly"):
+            nxt = trigger(find(jobs, "nightly"))[2] if any(x["name"] == "nightly" for x in jobs) else None
+        if last and last["result"] == "done" and was_skip(j, last["end"]): icon, res = c(YEL, "⏭"), c(YEL, "skipped (paused)")
+        elif last and last["result"] == "running": icon, res = c(CYN, "⟳"), c(CYN, "running")
+        elif last and last["result"] == "done": icon, res = c(GRN, "✔"), c(GRN, "ok")
+        elif last: icon, res = c(RED, "✘"), c(RED, last["result"])
+        else: icon, res = c(DIM, "·"), c(DIM, "never")
+        if tu and not (active and enabled): icon, sched = c(YEL, "⏸"), sched + c(YEL, " (off)")
+        pz, pu, pn, _ = pause_of(j)
+        if pz: icon, sched = c(YEL, "⏸"), sched + c(YEL, f"  PAUSED {until_text(pu)}" + (" (all)" if pn == "all" else ""))
+        st = summarize_state(state_line(j))
+        if st and re.search(r"FAILED|WARN", st): st = c(YEL, st)
+        rows.append((icon, j, sched, nxt, last, res, st))
+
+    w = max(len(r[1]["name"]) for r in rows) if rows else 8
+    for icon, j, sched, nxt, last, res, st in rows:
+        when = ago(last["end"] or last["start"]) if last else "—"
+        took = dur(last["end"] - last["start"]) if last and last["start"] and last["end"] else ""
+        print(f" {icon} {c(BOLD, j['name'].ljust(w))}  {c(DIM, j['scope'][:3])}  {sched}")
+        line = f"     last: {res} {when}" + (c(DIM, f" ({took})") if took else "")
+        if nxt: line += f"   next: {ago(nxt)}"
+        print(line)
+        if st: print(f"     {c(DIM, '↳')} {st}")
+    print()
+    probs = problems(jobs, quiet=True)
+    if probs: print(c(YEL, f"⚠ {len(probs)} problem(s) — run: watcher check"))
+    else: print(c(GRN, "✔ all healthy"))
+
+
+def problems(jobs, quiet=False):
+    p = []
+    for j in jobs:
+        tu, sched, nxt, active, enabled = trigger(j)
+        r = runs(j, 1)
+        if tu and not enabled: p.append(("warn", j["name"], f"trigger {tu} is disabled"))
+        elif tu and not active: p.append(("warn", j["name"], f"trigger {tu} is not active"))
+        if r and r[0]["result"] not in ("done", "running"):
+            p.append(("fail", j["name"], f"last run {r[0]['result']} {ago(r[0]['end'])} — watcher logs {j['name']}"))
+        if j["maxage"]:
+            ls = last_success(j)
+            # a job only counts as stale once it has existed (trigger active / unit installed) longer than MaxAge
+            since = ts_from_show(show(j["scope"], tu, "ActiveEnterTimestamp").get("ActiveEnterTimestamp")) if tu else None
+            since = since or os.path.getmtime(j["file"])
+            if ls and time.time() - ls > j["maxage"]:
+                p.append(("fail", j["name"], f"no successful run in {dur(j['maxage'])} (last success: {ago(ls)})"))
+            elif not ls and time.time() - since > j["maxage"]:
+                p.append(("fail", j["name"], f"has never succeeded (watched for {ago(since).replace(' ago', '')})"))
+            elif not ls:
+                p.append(("info", j["name"], "waiting for its first run" + (f" ({ago(nxt)})" if nxt else "")))
+        st = state_line(j)
+        details = state_details(j)
+        if st and "FAILED" in st and not (r and r[0]["result"] != "done"):
+            p.append(("fail", j["name"], f"reports: {summarize_state(st)}" + "".join(f"\n      - {d}" for d in details)))
+        elif st and "WARN" in st:
+            p.append(("warn", j["name"], f"reports: {summarize_state(st)}" + "".join(f"\n      - {d}" for d in details)))
+        elif r and r[0]["result"] not in ("done", "running") and details:
+            p[-1] = (p[-1][0], p[-1][1], p[-1][2] + "".join(f"\n      - {d}" for d in details)) if p and p[-1][1] == j["name"] else p[-1]
+        pz, pu, pn, since = pause_of(j)
+        if pz:
+            if (pu is None and time.time() - since > 86400) or (pu and pu - since > 86400 and time.time() - since > 86400):
+                p.append(("warn", j["name"], f"paused for over a day ({until_text(pu)}) — watcher resume"))
+            else:
+                p.append(("info", j["name"], f"paused {until_text(pu)}"))
+        if not j["onfailure"]:
+            p.append(("info", j["name"], "no OnFailure=watcher-notify@%n.service (won't notify on failure)"))
+    for scope in ("system", "user"):
+        out = sh(sysctl(scope) + ["--failed", "--plain", "--no-legend", "--no-pager"])
+        for l in out.splitlines():
+            u = l.split()[0] if l.split() else ""
+            if u and not any(j["unit"] == u and j["scope"] == scope for j in jobs):
+                p.append(("warn", f"{scope} unit", f"{u} is in failed state"))
+    rb = f"{HOME}/.local/state/update/reboot-needed"
+    if os.path.exists(rb):
+        p.append(("info", "system", "reboot recommended: " + open(rb).read().strip()))
+    try:
+        gpu = int(open(GUARD_PAUSE).read().strip())
+        if gpu > time.time(): p.append(("info", "claude-guard", f"paused until {time.strftime('%a %H:%M', time.localtime(gpu))} (logging only)"))
+    except (OSError, ValueError):
+        pass
+    for f in glob.glob(f"{HOME}/.local/bin/*"):
+        if os.path.islink(f) and not os.path.exists(f):
+            p.append(("warn", "scripts", f"broken link {f}"))
+    return [x for x in p if not (quiet and x[0] == "info")]
+
+
+def cmd_check(jobs):
+    probs = problems(jobs)
+    if not probs:
+        print(c(GRN, "✔ All automation healthy")); return 0
+    sev = {"fail": c(RED, "✘"), "warn": c(YEL, "⚠"), "info": c(CYN, "ℹ")}
+    for s, who, msg in sorted(probs, key=lambda x: ["fail", "warn", "info"].index(x[0])):
+        print(f" {sev[s]} {c(BOLD, who)}: {msg}")
+    return 1 if any(s in ("fail", "warn") for s, _, _ in probs) else 0
+
+
+def cmd_logs(jobs, args):
+    j = find(jobs, args[0])
+    extra = args[1:] or ["-n", "200"]
+    os.execvp(jctl(j["scope"])[0], jctl(j["scope"]) + ["-u", j["unit"], "-o", "short-iso"] + extra
+              + ([] if TTY and "-f" not in extra else ["--no-pager"]))
+
+
+def cmd_run(jobs, args):
+    j = find(jobs, args[0])
+    print(c(CYN, f"▶ starting {j['unit']}") + c(DIM, " (Ctrl-C stops watching; the job keeps running)"))
+    since = time.strftime("%Y-%m-%d %H:%M:%S")
+    follow = subprocess.Popen(jctl(j["scope"]) + ["-u", j["unit"], "-f", "-n0", "--since", since, "-o", "cat"])
+    rc = subprocess.run(sysctl(j["scope"]) + ["start", j["unit"]]).returncode
+    time.sleep(1); follow.terminate()
+    print(c(GRN, "✔ finished") if rc == 0 else c(RED, f"✘ failed (exit {rc}) — watcher logs {j['name']}"))
+    return rc
+
+
+def cmd_toggle(jobs, args, on):
+    j = find(jobs, args[0])
+    tu = trigger(j)[0]
+    if not tu: sys.exit(f"{j['name']} has no timer/path of its own ({j.get('schedule') or 'manual'})")
+    os.makedirs(PAUSE, exist_ok=True)
+    mk = f"{PAUSE}/{j.get('gate') or j['name']}"
+    if on and os.path.exists(mk): os.remove(mk)
+    if not on: open(mk, "w").write("disabled")
+    cmd = sysctl(j["scope"]) + ["enable" if on else "disable", "--now", tu]
+    if j["scope"] == "system": cmd = ["sudo"] + cmd
+    print(" ".join(cmd)); return subprocess.run(cmd).returncode
+
+
+def cmd_info(jobs, args):
+    j = find(jobs, args[0])
+    tu, sched, nxt, active, enabled = trigger(j)
+    print(c(BOLD, j["name"]), "—", j["desc"])
+    print(f"  scope     {j['scope']}\n  unit      {j['file']}")
+    print(f"  trigger   {tu or '—'}  ({sched})" + (f"  next {ago(nxt)}" if nxt else ""))
+    if j["state"]: print(f"  state     {j['state']}")
+    if j["maxage"]: print(f"  max age   {dur(j['maxage'])}")
+    print(f"  notify    {'yes' if j['onfailure'] else 'no'}")
+    for l in sh(sysctl(j["scope"]) + ["cat", j["unit"]]).splitlines():
+        if l.startswith(("ExecStart=", "ExecStartPre=")): print(f"  runs      {l.split('=', 1)[1].strip()}")
+    print(c(BOLD, "\n  recent runs"))
+    for r in runs(j, 8):
+        res = {"done": c(GRN, "ok"), "running": c(CYN, "running")}.get(r["result"], c(RED, r["result"]))
+        t = time.strftime("%a %m-%d %H:%M", time.localtime(r["end"] or r["start"]))
+        took = dur(r["end"] - r["start"]) if r["start"] and r["end"] else ""
+        print(f"    {t}  {res:<8} {c(DIM, took)}")
+    st = state_line(j)
+    if j["state"] and os.path.exists(j["state"]):
+        print(c(BOLD, "\n  state file")); print("    " + open(j["state"]).read().strip().replace("\n", "\n    "))
+
+
+def parse_until(args):
+    if not args: return None
+    a = " ".join(args).replace("until ", "").strip()
+    m = re.fullmatch(r"(\d+)\s*([mhd])", a)
+    if m: return int(time.time()) + int(m[1]) * {"m": 60, "h": 3600, "d": 86400}[m[2]]
+    m = re.fullmatch(r"(\d{1,2}):(\d\d)", a)
+    if m:
+        t = time.localtime(); tgt = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, int(m[1]), int(m[2]), 0, 0, 0, -1))
+        return int(tgt + (86400 if tgt <= time.time() else 0))
+    sys.exit(f"don't understand '{a}' — use 30m, 2h, 1d or until HH:MM")
+
+
+def cmd_pause(jobs, args):
+    gates = sorted({j["gate"] for j in jobs if j.get("gate")})
+    target = args[0] if args and args[0] in gates + ["all"] else "all"
+    rest = args[1:] if args and args[0] in gates + ["all"] else args
+    if args and target == "all" and args[0] not in ("all",) and not re.match(r"^(\d|until)", args[0]):
+        sys.exit(f"can't pause '{args[0]}'. Pausable: all, {', '.join(gates)}")
+    until = parse_until(rest)
+    os.makedirs(PAUSE, exist_ok=True)
+    open(f"{PAUSE}/{target}", "w").write(str(until) if until else "indefinite")
+    hit = [j for j in jobs if j.get("gate") and (target == "all" or j["gate"] == target)]
+    print(c(YEL, f"⏸ paused {target} {until_text(until)}"))
+    for j in hit:
+        nxt = trigger(j)[2]
+        if (j.get("schedule") or "").startswith("nightly"): continue
+        soon = nxt and (until is None or nxt < until)
+        print(f"   {j['name']:<12} " + (c(DIM, f"would have run {ago(nxt)} → will skip") if soon else c(DIM, "no run due in that window")))
+    if target in ("all", "nightly"): print(c(DIM, "   (nightly covers backup → update → verify)"))
+    print(c(DIM, "   A running job isn't interrupted. Undo: watcher resume"))
+
+
+def cmd_resume(jobs, args):
+    target = args[0] if args else "all"
+    names = [os.path.basename(f) for f in glob.glob(f"{PAUSE}/*")] if target == "all" else [target]
+    for n in names:
+        try: os.remove(f"{PAUSE}/{n}")
+        except OSError: pass
+    print(c(GRN, f"▶ resumed {', '.join(names) or 'nothing was paused'}"))
+    for f in glob.glob(f"{SKIPS}/*"):
+        g = os.path.basename(f)
+        if target != "all" and g != target: continue
+        ts = open(f).read().split()
+        if ts:
+            print(c(YEL, f"   {g} skipped {len(ts)} run(s) while paused (last {ts[-1][5:16].replace('T', ' ')})") + f" — run it now: watcher run {g}")
+        os.remove(f)
+
+
+def cmd_fix(args):
+    fixer = "/usr/local/bin/watcher-fix"
+    if not os.path.exists(fixer): sys.exit("watcher-fix isn't installed — run ~/.config/watcher/install.sh")
+    rc = subprocess.run(["python3", "-I", fixer, "--verify" if "--dry-run" not in args else "--dry-run"]).returncode
+    script = f"{HOME}/.local/state/watcher/needs-sudo.sh"
+    if "--dry-run" not in args and os.path.exists(script):
+        print("\n" + c(YEL + ";1", "These fixes need root. The script:") + "\n")
+        print(c(DIM, open(script).read()))
+        if TTY:
+            if input(c(BOLD, "Run it now? [y/N] ")).strip().lower() == "y":
+                rc = subprocess.run(["bash", script]).returncode
+                print(c(DIM, "\nre-checking…")); rc = subprocess.run(["python3", "-I", fixer, "--verify"]).returncode
+        else:
+            print(f"Run in a terminal:  bash {script}")
+    return rc
+
+
+ALERT = "/usr/local/bin/watcher-alert"
+
+
+def send_alert(title, body):
+    """Email through the root-owned central sender (if installed). Returns True on success."""
+    if not os.path.exists(ALERT): return False
+    return subprocess.run([ALERT, title, body], capture_output=True).returncode == 0
+
+
+def cmd_alerts(args):
+    conf = f"{HOME}/.config/watcher/alerts.conf"
+    cfg = dict(l.strip().split("=", 1) for l in open(conf) if "=" in l and not l.startswith("#")) if os.path.exists(conf) else {}
+    if args[:1] == ["test"]:
+        subprocess.run(["notify-send", "-a", "Watcher", "Watcher test", "Desktop notifications work"])
+        ok_ = send_alert("Watcher test", "Email alerts work. Filter on [system] in the subject.")
+        print(c(GRN, f"✔ test email sent to {cfg.get('EMAIL', '?')} (arrives in a minute or two)") if ok_
+              else c(RED, "✘ email failed — is ~/.config/watcher/install.sh installed?"))
+        return
+    print(c(BOLD, "Desktop") + ": GNOME notifications (always on)")
+    print(c(BOLD, "Email") + f": {cfg.get('EMAIL', 'not set')} via {cfg.get('METHOD', '?')}  " + c(DIM, "(subjects start with [system])"))
+    print(c(DIM, "   test: watcher alerts test · change: ~/.config/watcher/alerts.conf"))
+    print(c(BOLD, "Remote wipe / locate") + ": deadman status")
+
+
+def gib(b): return f"{b / 2**30:.1f} GiB" if b is not None else "?"
+
+
+def collect_metrics():
+    m = {"date": time.strftime("%F")}
+    envsh = f"source {HOME}/.config/backup/env && "
+    for key, repo in (("backup_bytes", "restic"), ("movies_bytes", "movies")):
+        r = subprocess.run(["bash", "-c", envsh + f'restic -r "rclone:$RCLONE_REMOTE_DIR/{repo}" stats --mode raw-data --no-lock --json'],
+                           capture_output=True, text=True, timeout=900)
+        try: m[key] = json.loads(r.stdout)["total_size"]
+        except (ValueError, KeyError): m[key] = None
+    r = subprocess.run(["bash", "-c", envsh + "rclone about gdrive: --json"], capture_output=True, text=True, timeout=120)
+    try: j = json.loads(r.stdout); m["drive_used"], m["drive_total"] = j.get("used"), j.get("total")
+    except ValueError: pass
+    dh = f"{HOME}/.local/state/disk-health/last-result"
+    if os.path.exists(dh):
+        w = re.search(r"NVMe (\d+)% worn", open(dh).read()); m["nvme_worn"] = int(w[1]) if w else None
+    m["snaps_system"] = len(glob.glob("/.snapshots/*/info.xml"))
+    r = subprocess.run(["snapper", "--jsonout", "-c", "home", "list"], capture_output=True, text=True)
+    try: m["snaps_home"] = len(json.loads(r.stdout)["home"]) - 1
+    except (ValueError, KeyError): m["snaps_home"] = None
+    st = os.statvfs("/"); m["root_free"] = st.f_bavail * st.f_frsize
+    r = subprocess.run(["fwupdmgr", "get-updates", "--json"], capture_output=True, text=True, timeout=120)
+    m["firmware"] = sorted(set(re.findall(r'"Name"\s*:\s*"([^"]+)"', r.stdout)))[:5]
+    return m
+
+
+def cmd_report(jobs, args):
+    notify = "--notify" in args
+    mf = f"{HOME}/.local/state/watcher/metrics.jsonl"
+    prev = None
+    if os.path.exists(mf):
+        rows = [json.loads(l) for l in open(mf) if l.strip()]
+        prev = next((r for r in reversed(rows) if r["date"] <= time.strftime("%F", time.localtime(time.time() - 5 * 86400))), None)
+    m = collect_metrics()
+    os.makedirs(os.path.dirname(mf), exist_ok=True)
+    with open(mf, "a") as f: f.write(json.dumps(m) + "\n")
+
+    def delta(k, fmt=gib):
+        if not prev or prev.get(k) is None or m.get(k) is None: return ""
+        d = m[k] - prev[k]
+        return c(DIM, f" ({'+' if d >= 0 else '-'}{fmt(abs(d))} vs {prev['date'][5:]})")
+
+    lines, problems_ = [], []
+    # nights: verify history
+    hist = sorted(glob.glob(f"{HOME}/.local/state/watcher/history/*.txt"))[-7:]
+    ok_n = sum(1 for h in hist if " OK " in open(h).readline())
+    fixed = sum(int(re.search(r"(\d+) fixed", l)[1]) for h in hist for l in open(h) if re.search(r"(\d+) fixed", l))
+    # per-job results this week
+    since = "-7d"
+    jobrows = []
+    for j in ordered(jobs):
+        out = sh(jctl(j["scope"]) + ["-u", j["unit"], "JOB_TYPE=start", "--since", since, "-o", "json", "--no-pager"])
+        evs = [json.loads(l) for l in out.splitlines() if l.strip()]
+        res = [(int(e["__REALTIME_TIMESTAMP"]) / 1e6, e.get("JOB_RESULT")) for e in evs if e.get("JOB_RESULT")]
+        skipped = sum(1 for t, r in res if r == "done" and was_skip(j, t))
+        okc = sum(1 for t, r in res if r == "done") - skipped
+        bad = sum(1 for t, r in res if r != "done")
+        jobrows.append((j["name"], okc, bad, skipped))
+        if bad: problems_.append(f"{j['name']} failed {bad}×")
+    print(c(BOLD, f"Weekly report — {time.strftime('%a %b %d')}"))
+    print(f"\n{c(BOLD, 'Nights')}     {ok_n}/{len(hist)} clean verifies · {fixed} auto-fix(es)")
+    print(c(BOLD, "Jobs") + "      " + "  ".join(f"{n} {c(GRN, str(o))}" + (c(RED, f"/{b}✘") if b else "") + (c(YEL, f"/{k}⏭") if k else "")
+                                           for n, o, b, k in jobrows if o or b or k) + c(DIM, "   (ok/✘ failed/⏭ skipped while paused)"))
+    print(f"{c(BOLD, 'Backups')}   system {gib(m.get('backup_bytes'))}{delta('backup_bytes')} · movies {gib(m.get('movies_bytes'))}{delta('movies_bytes')}")
+    if m.get("drive_total"):
+        print(f"{c(BOLD, 'Drive')}     {gib(m['drive_used'])} of {m['drive_total'] / 2**40:.1f} TiB ({m['drive_used'] / m['drive_total']:.1%})")
+    print(f"{c(BOLD, 'Disk')}      NVMe {m.get('nvme_worn', '?')}% worn{delta('nvme_worn', lambda x: f'{x}%')} · {gib(m['root_free'])} free"
+          f" · snapshots: {m['snaps_system']} system, {m.get('snaps_home', '?')} home")
+    tr = f"{HOME}/.local/state/tests/last-result"
+    tests_line = re.sub(r"^\S+\s+", "", open(tr).readline().strip()) if os.path.exists(tr) else "not run yet"
+    print(f"{c(BOLD, 'Tests')}     {tests_line}")
+    if m["firmware"]: print(f"{c(BOLD, 'Firmware')}  updates available: {', '.join(m['firmware'])} (fwupdmgr update)"); problems_.append("firmware updates")
+    rb = f"{HOME}/.local/state/update/reboot-needed"
+    if os.path.exists(rb): print(c(YEL, "↻ reboot pending")); problems_.append("reboot pending")
+    if "FAILED" in tests_line: problems_.append("tests failing")
+    pz = [os.path.basename(f) for f in glob.glob(f"{PAUSE}/*")]
+    if pz: print(c(YEL, f"⏸ paused: {', '.join(pz)}")); problems_.append("jobs paused")
+    verdict = "all good" if not problems_ else "attention: " + ", ".join(problems_)
+    print("\n" + (c(GRN, "✔ " + verdict) if not problems_ else c(YEL, "⚠ " + verdict)))
+    summary = f"{time.strftime('%FT%T%z')} {'OK' if not problems_ else 'NOTE'} · {verdict} · {ok_n}/{len(hist)} clean nights · backup {gib(m.get('backup_bytes'))} · movies {gib(m.get('movies_bytes'))}"
+    open(f"{HOME}/.local/state/watcher/last-report", "w").write(summary + "\n")
+    if notify:
+        body = f"{verdict}\n{ok_n}/{len(hist)} clean nights, {fixed} auto-fixes\nbackup {gib(m.get('backup_bytes'))}, movies {gib(m.get('movies_bytes'))}\nNVMe {m.get('nvme_worn', '?')}% worn · tests: {tests_line[:60]}"
+        subprocess.run(["notify-send", "-a", "Watcher", "Weekly report", body])
+        send_alert("Weekly report: " + ("all good" if not problems_ else "attention needed"), body)
+
+
+def cmd_claude(args):
+    """Claude Code activity from the claude-guard audit log (system journal, tag claude-audit)."""
+    span = {"today": "today", "week": "-7d", "yesterday": "yesterday"}.get(args[0] if args else "today", args[0] if args else "today")
+    show_all = "--all" in args
+    out = sh(["journalctl", "-t", "claude-audit", "--since", span, "-o", "json", "--no-pager"])
+    evs = []
+    for l in out.splitlines():
+        try:
+            e = json.loads(l); m = json.loads(e["MESSAGE"]); m["t"] = int(e["__REALTIME_TIMESTAMP"]) / 1e6; evs.append(m)
+        except (ValueError, KeyError, TypeError):
+            continue
+    installed = os.path.exists("/etc/claude-code/managed-settings.json")
+    print(c(BOLD, f"Claude activity — {span}") + ("" if installed else c(RED, "   ⚠ guard NOT installed (~/.config/claude-guard/install.sh)")))
+    if installed and os.path.exists(GUARD_PAUSE): cmd_guard(["status"])
+    notes = [e for e in evs if e.get("ev") == "guard"]
+    for e in notes[-5:]: print(c(YEL, f"  {time.strftime('%m-%d %H:%M', time.localtime(e['t']))} {e.get('act')} (by {e.get('by')})"))
+    sessions = {e["sid"] for e in evs if e.get("sid")}
+    tools = [e for e in evs if e.get("ev") == "tool"]
+    counts = {}
+    for e in tools: counts[e["tool"].replace("mcp__claude-in-chrome__", "browser:")] = counts.get(e["tool"].replace("mcp__claude-in-chrome__", "browser:"), 0) + 1
+    print(f"  {len(sessions)} session(s) · {len(tools)} actions · " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1])[:8]))
+    flagged = [e for e in tools if e.get("act") in ("deny", "ask") or e.get("cat") in ("sudo",)]
+    print(c(BOLD, f"\n  Flagged ({len(flagged)})"))
+    for e in flagged[-25:]:
+        icon = {"deny": c(RED, "✘ blocked"), "ask": c(YEL, "? asked  ")}.get(e["act"], c(CYN, "• noted  "))
+        print(f"  {time.strftime('%m-%d %H:%M', time.localtime(e['t']))} {icon} {e.get('cat',''):<17} {c(DIM, (e.get('detail') or e.get('why',''))[:90])}")
+    if not flagged: print(c(GRN, "  nothing suspicious"))
+    br = [e for e in tools if e.get("cat", "").startswith("browser")]
+    if br:
+        print(c(BOLD, f"\n  Browser ({len(br)})"))
+        for e in br[-15:]: print(f"  {time.strftime('%H:%M', time.localtime(e['t']))} {c(DIM, (e.get('detail') or '')[:100])}")
+    if show_all:
+        print(c(BOLD, "\n  All actions"))
+        for e in tools: print(f"  {time.strftime('%H:%M:%S', time.localtime(e['t']))} {e['tool'][:22]:<22} {c(DIM, (e.get('detail') or '')[:100])}")
+    else:
+        print(c(DIM, "\n  every action: watcher claude [today|yesterday|week] --all"))
+
+
+GUARD_PAUSE = "/etc/claude-code/guard-paused-until"
+
+
+def guard_notice(title, level="warning"):
+    subprocess.run(["logger", "-t", "claude-audit", "-p", f"user.{level}", "--",
+                    json.dumps({"ev": "guard", "act": title, "by": os.environ.get("USER", "?")})])
+    subprocess.run(["notify-send", "-a", "Claude guard", "-i", "security-medium", title])
+    send_alert(title, "Recorded in the audit log: watcher claude")
+
+
+def cmd_guard(args):
+    sub = args[0] if args else "status"
+    installed = os.path.exists("/etc/claude-code/managed-settings.json")
+    try: pu = int(open(GUARD_PAUSE).read().strip())
+    except (OSError, ValueError): pu = None
+    if pu and pu <= time.time(): pu = None
+    if sub == "status":
+        print(c(BOLD, "Claude guard: ") + (c(RED, "NOT installed (~/.config/claude-guard/install.sh)") if not installed else
+              c(YEL, f"PAUSED until {time.strftime('%a %H:%M', time.localtime(pu))} (logging only)") if pu else c(GRN, "active")))
+        print(c(DIM, "  pause: watcher guard pause [30m|2h|1d]   resume: watcher guard resume   activity: watcher claude"))
+        return
+    if sub in ("pause", "resume") and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("watcher guard pause/resume only works from your own terminal (it needs your sudo password).")
+    if sub == "pause":
+        until = parse_until(args[1:]) if len(args) > 1 else int(time.time()) + 3600
+        if until - time.time() > 86400: sys.exit("max pause is 1 day")
+        tmp = f"{HOME}/.cache/guard-pause.{os.getpid()}"
+        open(tmp, "w").write(str(until))
+        rc = subprocess.run(["sudo", "install", "-m", "644", "-o", "root", "-g", "root", tmp, GUARD_PAUSE]).returncode
+        os.remove(tmp)
+        if rc: sys.exit("not paused (sudo failed)")
+        t = time.strftime("%a %H:%M", time.localtime(until))
+        guard_notice(f"Claude guard PAUSED until {t}")
+        print(c(YEL, f"⏸ guard paused until {t}") + c(DIM, " — still logging everything; anti-tamper stays on. Resume: watcher guard resume"))
+    elif sub == "resume":
+        if subprocess.run(["sudo", "rm", "-f", GUARD_PAUSE]).returncode: sys.exit("not resumed (sudo failed)")
+        guard_notice("Claude guard resumed", "info")
+        print(c(GRN, "▶ guard active again"))
+    else:
+        sys.exit("usage: watcher guard [status|pause [30m|2h|1d]|resume]")
+
+
+KNOWN_BINARIES = {"claude": "Claude Code CLI", "agy": "Antigravity CLI"}
+
+
+def script_info(path):
+    """desc, group and usage lines parsed from a script's header (comments or docstring)."""
+    name = os.path.basename(path)
+    if os.path.getsize(path) > 2_000_000 or b"\0" in open(path, "rb").read(2048):
+        return {"name": name, "desc": KNOWN_BINARIES.get(name, "(program)"), "group": "Installed tools", "usage": [], "binary": True}
+    head = open(path, errors="ignore").read().split("\n")[:70]
+    desc, group, usage, in_desc = "", "Other", [], False
+    for l in head[1:]:
+        t = re.sub(r'^(\s*#|""")', "", l)          # keep docstring indentation (it marks usage lines)
+        m = re.match(rf"^\s{{2,}}({re.escape(name)}(?: \S+)*)(?:\s{{2,}}(\S.*))?$", t)
+        if m and not l.lstrip().startswith(("echo", "print", "if ", "case")):
+            usage.append((m[1].strip(), (m[2] or "").strip())); in_desc = False; continue
+        if not desc:
+            m = re.match(rf"\s*{re.escape(name)}\s+[—-]+\s+(.*)", t)
+            if m: desc = m[1].strip().rstrip('"'); in_desc = not desc.endswith((".", ")", ":")); continue
+        m = re.match(r"\s*group:\s*(.+)", t)
+        if m: group = m[1].strip(); continue          # (tag may sit between a description and its wrapped line)
+        if in_desc:                                   # description wrapped onto the next comment line
+            if t.strip() and not t.strip().startswith(("-", "*")): desc += " " + t.strip(); in_desc = not t.strip().endswith((".", ")", ":"))
+            else: in_desc = False
+    desc = re.sub(r"\s+", " ", desc).rstrip(".:")
+    if len(desc) > 110: desc = desc[:107].rsplit(" ", 1)[0] + "…"
+    return {"name": name, "desc": desc, "group": group, "usage": usage, "binary": False}
+
+
+def shell_shortcuts():
+    out, seen = [], set()
+    for f in sorted(glob.glob(f"{HOME}/.bashrc.d/*.sh")):
+        lines = open(f).read().splitlines()
+        for i, l in enumerate(lines):
+            m = re.match(r"\s*alias\s+([\w.-]+)='([^']*)'\s*(?:#\s*(.*))?", l)
+            if m and m[1] not in seen:
+                seen.add(m[1])
+                if m[2].split()[0] == m[1] and not m[3]: continue      # same command + color flags only
+                out.append((m[1], m[3] or f"→ {m[2]}"))
+            m = re.match(r"\s*([a-z][\w-]*)\s*\(\)\s*\{", l)
+            if m and m[1] not in seen:
+                seen.add(m[1])
+                prev = lines[i - 1].strip() if i else ""
+                out.append((m[1], prev.lstrip("# ").strip() if prev.startswith("#") else "shell function"))
+    return out
+
+
+def skills():
+    out = []
+    for d in sorted(glob.glob(f"{HOME}/.claude/skills/*/SKILL.md")):
+        m = re.search(r"^description:\s*(.*)$", open(d).read(), re.M)
+        desc = (m[1] if m else "").split(". Use")[0].split(" Use for")[0]
+        out.append(("/" + os.path.basename(os.path.dirname(d)), desc))
+    return out
+
+
+def all_scripts():
+    return [script_info(f) for f in sorted(glob.glob(f"{HOME}/.local/bin/*"))
+            if os.path.isfile(f) and os.access(f, os.X_OK)]
+
+
+def cmd_commands(args):
+    scripts = all_scripts()
+    if args:
+        key = args[0].lstrip("/")
+        for sc in scripts:
+            if sc["name"] == key:
+                print(c(BOLD, sc["name"]) + " — " + (sc["desc"] or c(DIM, "no description")) + c(DIM, f"   [{sc['group']}]"))
+                w = max((len(u) for u, _ in sc["usage"]), default=0)
+                for u, e in sc["usage"]: print(f"  {c(CYN, u.ljust(w))}  {e}")
+                if not sc["usage"]: print(c(DIM, f"  (no usage lines in its header — try: {sc['name']} --help)"))
+                return
+        for n, d in skills():
+            if n == "/" + key: print(c(MAG, n), "—", d, c(DIM, "\n  (Claude Code skill: type it in Claude)")); return
+        for n, d in shell_shortcuts():
+            if n == key: print(c(CYN, n), "—", d, c(DIM, "  (shell shortcut from ~/.bashrc.d)")); return
+        sys.exit(f"no custom command '{key}' — see: watcher commands")
+    order = ["System care", "DVD & movies", "Claude"]
+    groups = sorted({sc["group"] for sc in scripts}, key=lambda g: (order.index(g) if g in order else 50, g == "Installed tools", g))
+    w = max(len(sc["name"]) for sc in scripts) + 2
+    for g in groups:
+        print(c(BOLD, g))
+        for sc in [x for x in scripts if x["group"] == g]:
+            print(f"  {c(CYN, sc['name'].ljust(w))}{sc['desc'] or c(YEL, '(no description)')}")
+            subs = []
+            for u, _ in sc["usage"]:
+                parts = u.split()
+                if len(parts) < 2: continue
+                tok = parts[1]
+                if tok.startswith(('"', "/", "<", "[", ".")) or tok in subs: continue
+                subs.append(tok)
+            if subs: print(" " * (w + 2) + c(DIM, " · ".join(subs)))
+        print()
+    print(c(BOLD, "Shell shortcuts") + c(DIM, "  (~/.bashrc.d)"))
+    for n, d in shell_shortcuts(): print(f"  {c(CYN, n.ljust(w))}{c(DIM, d)}")
+    print("\n" + c(BOLD, "Claude Code skills") + c(DIM, "  (type in Claude)"))
+    for n, d in skills(): print(f"  {c(MAG, n.ljust(w))}{c(DIM, d if len(d) <= 100 else d[:97].rsplit(' ', 1)[0] + '…')}")
+    print(c(DIM, "\nFull usage of one:  watcher commands <name>"))
+
+
+def main():
+    a = sys.argv[1:]
+    jobs = discover()
+    cmd = a[0] if a else "status"
+    if cmd in ("status", "list", "ls"): cmd_dashboard(jobs)
+    elif cmd == "check": sys.exit(cmd_check(jobs))
+    elif cmd == "logs" and len(a) > 1: cmd_logs(jobs, a[1:])
+    elif cmd == "run" and len(a) > 1: sys.exit(cmd_run(jobs, a[1:]))
+    elif cmd == "info" and len(a) > 1: cmd_info(jobs, a[1:])
+    elif cmd in ("enable", "disable") and len(a) > 1: sys.exit(cmd_toggle(jobs, a[1:], cmd == "enable"))
+    elif cmd == "fix": sys.exit(cmd_fix(a[1:]))
+    elif cmd == "alerts": cmd_alerts(a[1:])
+    elif cmd in ("deadman", "remote"):
+        os.execvp(f"{HOME}/.local/bin/{cmd}", [cmd] + a[1:])
+    elif cmd == "report": cmd_report(jobs, a[1:])
+    elif cmd == "claude": cmd_claude(a[1:])
+    elif cmd == "guard": cmd_guard(a[1:])
+    elif cmd == "pause": cmd_pause(jobs, a[1:])
+    elif cmd in ("resume", "unpause"): cmd_resume(jobs, a[1:])
+    elif cmd in ("test", "tests"):
+        os.execvp("python3", ["python3", "-I", f"{HOME}/.config/watcher/tests.py"] + a[1:])
+    elif cmd in ("commands", "cmds", "tools"): cmd_commands(a[1:])
+    else: print(__doc__.split("usage:")[1].rstrip())
+
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: pass

@@ -1,0 +1,3 @@
+# Where watcher alerts go (read by /usr/local/bin/watcher-alert). Copy to ~/.config/watcher/alerts.conf.
+METHOD=ntfy-email
+EMAIL=you@example.com

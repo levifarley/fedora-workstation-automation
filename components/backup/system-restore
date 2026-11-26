@@ -1,0 +1,216 @@
+#!/bin/bash
+# system-restore — rebuild this Fedora setup from the Google Drive backup (automates RESTORE.md).
+# group: System care
+#   system-restore                 run every phase (each is skipped once done; safe to re-run after fixing a problem)
+#   system-restore --rehearsal     same, inside a throwaway VM: no NVIDIA/firmware, never writes to Drive/GitHub/phone
+#   system-restore --phase NAME    run one phase: tools stage repos packages home usrlocal flatpak installers services dconf etc verify
+#   system-restore --list          show phases and which are done
+# Needs before starting: ~/.config/rclone/rclone.conf (Drive login) and ~/.config/backup/restic-password (from Levi).
+# Never overwrites /etc blindly: it writes a review report of every changed /etc file instead (phase "etc").
+set -uo pipefail
+REHEARSAL=0; ONLY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rehearsal) REHEARSAL=1 ;;
+        --phase) ONLY="$2"; shift ;;
+        --list) LIST=1 ;;
+        -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    esac; shift
+done
+PHASES=(tools stage repos packages home usrlocal flatpak installers services dconf etc verify)
+STAGE=/var/tmp/restore-staging
+DONE="$HOME/.local/state/system-restore"; mkdir -p "$DONE"
+LOG="$HOME/system-restore.log"
+export RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf" RCLONE_DRIVE_USE_TRASH=false RCLONE_TPSLIMIT=8
+export RESTIC_REPOSITORY="rclone:gdrive:fedora-backup/restic" RESTIC_PASSWORD_FILE="$HOME/.config/backup/restic-password"
+B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
+say()  { echo "${B}[$(date +%H:%M:%S)] $*${N}" | tee -a "$LOG"; }
+note() { echo "${Y}  ! $*${N}" | tee -a "$LOG"; echo "$*" >>"$DONE/notes.txt"; }
+M="$STAGE/home/levi/.local/share/system-manifest"
+SB="$STAGE/var/lib/system-backup"
+
+if [ "${LIST:-0}" = 1 ]; then
+    for p in "${PHASES[@]}"; do printf '  %-11s %s\n' "$p" "$([ -f "$DONE/$p" ] && echo "${G}done $(cat "$DONE/$p")${N}" || echo pending)"; done
+    exit 0
+fi
+
+# ---------------------------------------------------------------- phases
+ph_tools() {
+    [ $REHEARSAL = 1 ] && sudo hostnamectl set-hostname fedora-rehearsal
+    sudo dnf install -y restic rclone jq rsync zstd tar python3 || return 1
+    [ -s "$RCLONE_CONFIG" ] || { echo "Missing Drive login: create it with step 2 of RESTORE.md (rclone config create gdrive drive ...)"; return 1; }
+    [ -s "$RESTIC_PASSWORD_FILE" ] || { echo "Missing $RESTIC_PASSWORD_FILE — paste the restic password from your password manager (chmod 600)"; return 1; }
+    restic snapshots --latest 1 --no-lock || return 1
+}
+
+ph_stage() {
+    sudo mkdir -p "$STAGE" && sudo chown "$USER:" "$STAGE"
+    restic restore latest --target "$STAGE" --no-lock || return 1
+    [ -d "$M" ] && [ -f "$SB/etc.tar.zst" ] || { echo "snapshot is missing the manifest or /etc archive"; return 1; }
+    mkdir -p "$STAGE/etc-archive" && tar --zstd -xf "$SB/etc.tar.zst" -C "$STAGE/etc-archive" 2>/dev/null
+    sudo chown -R "$USER:" "$STAGE/etc-archive" 2>/dev/null; true
+}
+
+ph_repos() {
+    local E="$STAGE/etc-archive/etc"
+    # third-party repo files + their signing keys (Fedora's own repos already exist on a fresh install)
+    for f in "$E"/yum.repos.d/*.repo; do            # third-party .repo files (Fedora's own already exist; never overwrite)
+        b=$(basename "$f")
+        [ -e "/etc/yum.repos.d/$b" ] || { sudo install -m 644 "$f" /etc/yum.repos.d/ && echo "  + repo $b"; }
+    done
+    sudo cp -n "$E"/pki/rpm-gpg/* /etc/pki/rpm-gpg/ 2>/dev/null
+    # repo "release" packages keep their .repo files under /usr/share, not /etc — reinstall them
+    local list="$M/dnf-userinstalled.txt" fv; fv=$(rpm -E %fedora)
+    grep -qx fedora-workstation-repositories "$list" && sudo dnf install -y fedora-workstation-repositories
+    for r in free nonfree; do
+        grep -qx "rpmfusion-$r-release" "$list" && ! rpm -q "rpmfusion-$r-release" >/dev/null &&
+            sudo dnf install -y "https://mirrors.rpmfusion.org/$r/fedora/rpmfusion-$r-release-$fv.noarch.rpm"
+    done
+    # switch back on every repo that was enabled on the old system (skip NVIDIA's in a VM)
+    awk 'NR>1 {print $1}' "$M/dnf-repos-enabled.txt" | while read -r id; do
+        [ $REHEARSAL = 1 ] && [[ "$id" == *nvidia* ]] && continue
+        dnf repolist --disabled -q 2>/dev/null | awk '{print $1}' | grep -qx "$id" && sudo dnf config-manager setopt "$id.enabled=1" && echo "  + enabled $id"
+    done
+    sudo dnf makecache -q || note "some repositories didn't load (dnf makecache) — check dnf repolist"
+    true
+}
+
+ph_packages() {
+    local list="$M/dnf-userinstalled.txt" want="$DONE/packages-wanted.txt"
+    grep -vE '^\s*$' "$list" | sort -u >"$want"
+    if [ $REHEARSAL = 1 ]; then   # a VM has no NVIDIA GPU or ThinkPad firmware; kernels come from the image
+        grep -vE '^(akmod-|kmod-|xorg-x11-drv-nvidia|nvidia-|kernel|fwupd-plugin)' "$want" >"$want.tmp" && mv "$want.tmp" "$want"
+    fi
+    say "Installing $(wc -l <"$want") packages (this is the long part)"
+    sudo dnf install -y --skip-unavailable --skip-broken $(cat "$want") 2>&1 | tee -a "$LOG" | grep -E '^(Installing|Transaction|Complete|Error|No match|Problem)' || true
+    rpm -q $(cat "$want") 2>/dev/null | grep 'is not installed' | awk '{print $2}' >"$DONE/packages-missing.txt"
+    local miss; miss=$(wc -l <"$DONE/packages-missing.txt")
+    if [ "$miss" -gt 0 ]; then
+        # split: not offered by any enabled repo (installed by hand from a download) vs. a real install failure
+        local manual="" failed="" p
+        while read -r p; do
+            if [ -z "$(dnf repoquery -q --latest-limit 1 "$p" 2>/dev/null)" ]; then manual+="$p "; else failed+="$p "; fi
+        done <"$DONE/packages-missing.txt"
+        [ -n "$manual" ] && note "installed by hand on the old system (not in any repo) — reinstall manually if still wanted: $manual"
+        [ -n "$failed" ] && note "available but failed to install (check $LOG): $failed"
+    fi
+    true
+}
+
+ph_home() {
+    # keep a copy of anything the fresh install already had that the restore would overwrite
+    local keep="$HOME/.pre-restore-$(date +%F)"
+    local excl=(--exclude '.cache/' --exclude '.local/state/system-restore/' --exclude 'system-restore.log')
+    [ $REHEARSAL = 1 ] && excl+=(--exclude '.ssh/authorized_keys')
+    rsync -aHAX --backup --backup-dir="$keep" "${excl[@]}" "$STAGE/home/levi/" "$HOME/" || return 1
+    # programs whose binaries aren't in the backup (reinstallable) leave dangling links behind
+    local l
+    for l in "$HOME"/.local/bin/*; do
+        [ -L "$l" ] && [ ! -e "$l" ] || continue
+        case "$(basename "$l")" in
+            claude) note "Claude Code needs reinstalling (its program isn't in the backup): curl -fsSL https://claude.ai/install.sh | bash — then install the guard first: ~/.config/claude-guard/install.sh" ;;
+            *)      note "broken link ~/.local/bin/$(basename "$l") → $(readlink "$l") (program not in the backup; reinstall it)" ;;
+        esac
+    done
+    if [ $REHEARSAL = 1 ]; then
+        # The rehearsal VM must never act as the real machine: no pushes, no phone alerts, no scheduled jobs
+        mkdir -p "$HOME/.local/state/watcher/paused" && echo indefinite >"$HOME/.local/state/watcher/paused/all"
+        rm -rf "$HOME/.config/gh" "$HOME/.config/watcher/ntfy-topic" "$HOME/.config/watcher/healthchecks-url"
+        git --git-dir="$HOME/.dotfiles" remote remove origin 2>/dev/null
+        note "rehearsal safety: all watcher jobs paused, GitHub login + phone-alert topic removed, dotfiles remote removed"
+    fi
+    true
+}
+
+ph_usrlocal() {
+    sudo tar --zstd -xpf "$SB/usr-local.tar.zst" -C / && sudo restorecon -R /usr/local >/dev/null 2>&1; true
+}
+
+ph_flatpak() {
+    flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo &&
+        flatpak install --user -y --noninteractive flathub com.makemkv.MakeMKV
+}
+
+ph_installers() {
+    # each installer is re-runnable; order matters (backup → update/nightly → snapshots → watcher → guard)
+    local i
+    for i in backup/install.sh update/install.sh snapshots/install.sh watcher/install.sh claude-guard/install.sh; do
+        say "  installer $i"
+        bash "$HOME/.config/$i" </dev/null 2>&1 | tee -a "$LOG" | tail -3 || note "$i reported a problem (see $LOG)"
+    done
+    # firewall: make sure it's on (Workstation has it on; minimal installs don't), then apply the tight laptop zone
+    if rpm -q firewalld >/dev/null || sudo dnf install -y firewalld; then
+        sudo systemctl enable --now firewalld && bash "$HOME/.config/watcher/firewall-laptop-zone.sh" </dev/null | tail -2
+        if [ $REHEARSAL = 1 ]; then   # the rehearsal VM is driven over SSH — the laptop zone would lock it out
+            sudo firewall-cmd -q --permanent --zone=laptop --add-service=ssh && sudo firewall-cmd -q --reload
+            note "rehearsal only: SSH allowed in the VM's firewall (your real laptop zone blocks it)"
+        fi
+    else note "couldn't install firewalld — the laptop firewall zone is NOT applied"; fi
+    systemctl --user daemon-reload
+    true
+}
+
+ph_services() {
+    local u
+    awk '$2=="enabled"{print $1}' "$SB/system-services-enabled.txt" 2>/dev/null | while read -r u; do
+        systemctl cat "$u" >/dev/null 2>&1 || continue
+        [ "$(systemctl is-enabled "$u" 2>/dev/null)" = enabled ] && continue
+        [ $REHEARSAL = 1 ] && [[ "$u" =~ ^(nvidia|thinkfan|fwupd|bluetooth|ModemManager) ]] && continue
+        sudo systemctl enable "$u" >/dev/null 2>&1 && echo "  enabled $u"
+    done
+    # user jobs came back enabled with the home folder; start them now instead of waiting for the next login
+    systemctl --user daemon-reload
+    systemctl --user list-unit-files --type=timer,path --state=enabled --no-legend 2>/dev/null | awk '{print $1}' |
+        while read -r u; do systemctl --user start "$u" 2>/dev/null && echo "  started $u"; done
+    true
+}
+
+ph_dconf() {
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dconf >/dev/null && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+        dconf load / <"$M/dconf-full.ini" && echo "  GNOME settings loaded (log out and back in)"
+    else
+        note "no desktop session — run later from GNOME: dconf load / < ~/.local/share/system-manifest/dconf-full.ini"
+    fi
+    true
+}
+
+ph_etc() {
+    # never copy /etc blindly: write a review report of every file Levi had changed, with diffs against this install
+    local E="$STAGE/etc-archive" out="$HOME/restore-etc-review.txt" f
+    {
+        echo "# /etc files that differed from package defaults on the old system. Review each; copy with: sudo cp -a $E/etc/<file> /etc/<file>"
+        echo "# Never copy blindly: fstab, crypttab, default/grub, machine-id, hostname (disk UUIDs/identity differ)."
+        awk '{print $NF}' "$SB/rpm-modified-files.txt" | grep '^/etc/' | sort -u | while read -r f; do
+            echo; echo "=== $f"
+            if [[ "$f" =~ ^/etc/(fstab|crypttab|default/grub|machine-id|hostname)$ ]]; then echo "(identity/disk file — don't copy)"; continue; fi
+            sudo diff -u "$f" "$E$f" 2>&1 | head -40
+        done
+        echo; echo "=== custom units / rules / connections on the old system"
+        ls "$E"/etc/systemd/system/*.service "$E"/etc/systemd/system/*.timer "$E"/etc/polkit-1/rules.d/* 2>/dev/null | sed "s|$E||"
+        sudo ls "$E/etc/NetworkManager/system-connections/" 2>/dev/null | sed 's|^|wifi: |'
+    } >"$out"
+    note "review /etc differences in ~/restore-etc-review.txt (nothing in /etc was overwritten)"
+}
+
+ph_verify() {
+    "$HOME/.local/bin/watcher" test 2>&1 | tee "$DONE/verify-tests.txt" | tail -25
+    "$HOME/.local/bin/watcher" check 2>&1 | tee "$DONE/verify-check.txt" | tail -15
+    true
+}
+
+# ---------------------------------------------------------------- runner
+say "system-restore$([ $REHEARSAL = 1 ] && echo ' (REHEARSAL)') — log: $LOG"
+for p in "${PHASES[@]}"; do
+    [ -n "$ONLY" ] && [ "$p" != "$ONLY" ] && continue
+    if [ -z "$ONLY" ] && [ -f "$DONE/$p" ]; then echo "  ✓ $p (already done)"; continue; fi
+    say "▶ $p"
+    t0=$(date +%s)
+    if "ph_$p"; then
+        echo "$(date '+%F %T') in $(( $(date +%s) - t0 ))s" >"$DONE/$p"; echo "${G}  ✔ $p${N}"
+    else
+        echo "${R}  ✘ $p failed — fix the problem above, then re-run system-restore (finished phases are skipped)${N}" | tee -a "$LOG"
+        exit 1
+    fi
+done
+say "${G}Restore finished.${N} Notes: $DONE/notes.txt  ·  /etc review: ~/restore-etc-review.txt"
+[ -f "$DONE/notes.txt" ] && sed 's/^/  • /' "$DONE/notes.txt"

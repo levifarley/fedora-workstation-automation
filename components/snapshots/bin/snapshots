@@ -1,0 +1,225 @@
+#!/usr/bin/python3 -I
+"""snapshots — browse and restore btrfs snapshots (snapper: "root" = system, "home" = /home).
+group: System care
+
+usage:
+  snapshots                         list recent system + home snapshots
+  snapshots pkgs <N>                packages changed by the dnf transaction that snapshot N (pre) wraps
+  snapshots versions <file>         every distinct saved version of a file in /home snapshots
+  snapshots get <file> [N]          copy a file/dir from home snapshot N (default: newest that differs) into ~/restored/
+  snapshots create [description]    take a snapshot of home now (and system too, with sudo)
+  snapshots undo <N>                SYSTEM: revert the files a dnf transaction changed (pre N → its post), live, sudo
+  snapshots rollback <N> [--yes]    SYSTEM: make snapshot N the running system after a reboot (dry run without --yes)
+  snapshots gui                     open Btrfs Assistant
+"""
+import calendar, glob, json, os, re, shutil, subprocess, sys, time, xml.etree.ElementTree as ET
+
+HOME = os.path.expanduser("~")
+TTY = sys.stdout.isatty()
+def c(code, s): return f"\033[{code}m{s}\033[0m" if TTY else s
+B, DIM, RED, GRN, YEL, CYN, MAG = "1", "2", "31", "32", "33", "36", "35"
+
+
+def root_snaps():
+    out = []
+    for f in glob.glob("/.snapshots/*/info.xml"):
+        try:
+            x = ET.parse(f).getroot()
+        except (ET.ParseError, OSError):
+            continue
+        g = lambda k: (x.findtext(k) or "").strip()
+        out.append({"num": int(g("num")), "type": g("type"), "date": g("date"), "desc": g("description"),
+                    "pre": int(g("pre_num")) if g("pre_num") else None, "cleanup": g("cleanup")})
+    return sorted(out, key=lambda s: s["num"])
+
+
+def home_snaps():
+    try:
+        r = subprocess.run(["snapper", "--jsonout", "-c", "home", "list"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    if r.returncode != 0: return None
+    snaps = json.loads(r.stdout).get("home", [])
+    return [{"num": s["number"], "type": s["type"], "date": s["date"], "desc": s.get("description", ""),
+             "pre": s.get("pre-number")} for s in snaps if s["number"] != 0]
+
+
+def local(utc):  # snapper info.xml dates are UTC "YYYY-MM-DD HH:MM:SS"
+    try:
+        t = calendar.timegm(time.strptime(utc, "%Y-%m-%d %H:%M:%S"))
+        return time.strftime("%a %m-%d %H:%M", time.localtime(t))
+    except ValueError:
+        return utc
+
+
+def cmd_list():
+    rs = root_snaps()
+    print(c(B, "System (/)") + c(DIM, "  — pre/post pairs around every dnf transaction"))
+    if not rs and not os.path.isdir("/.snapshots"):
+        print("  not set up — run ~/.config/snapshots/install.sh")
+    posts = {s["pre"]: s for s in rs if s["type"] == "post"}
+    rows = [s for s in rs if s["type"] != "post"][-12:]
+    for s in rows:
+        if s["type"] == "pre":
+            p = posts.get(s["num"])
+            pair = f"#{s['num']}→{p['num']}" if p else f"#{s['num']}→?"
+            note = "" if p else c(YEL, " (no post: interrupted or in progress)")
+            print(f"  {c(CYN, pair.ljust(10))} {local(s['date'])}  {s['desc'] or 'dnf'}{note}")
+        else:
+            print(f"  {c(CYN, ('#' + str(s['num'])).ljust(10))} {local(s['date'])}  {s['desc']}")
+    hs = home_snaps()
+    print()
+    print(c(B, "Home (/home)") + c(DIM, "  — hourly; 24 hourly · 7 daily · 4 weekly"))
+    if hs is None:
+        print("  not set up (or not allowed) — run ~/.config/snapshots/install.sh")
+    elif hs:
+        tl = [s for s in hs if s["desc"] == "timeline"]
+        print(f"  {len(hs)} snapshots · newest #{hs[-1]['num']} {hs[-1]['date'][5:16]} · oldest #{hs[0]['num']} {hs[0]['date'][5:16]}"
+              + c(DIM, f" · {len(tl)} timeline"))
+        for s in [s for s in hs if s["desc"] != "timeline"][-5:]:
+            print(f"  {c(CYN, ('#' + str(s['num'])).ljust(10))} {s['date'][5:16]}  {s['desc']}")
+    st = os.statvfs("/")
+    print(c(DIM, f"\nDisk free: {st.f_bavail * st.f_frsize / 2**30:.0f} GiB · snapshots share unchanged data, so they cost little"))
+
+
+def rpm_list(root):
+    db = f"{root}/usr/lib/sysimage/rpm"
+    r = subprocess.run(["rpm", "-qa", "--dbpath", db, "--qf", "%{NAME}.%{ARCH} %{VERSION}-%{RELEASE}\n"],
+                       capture_output=True, text=True)
+    return dict(l.split(" ", 1) for l in r.stdout.splitlines() if " " in l)
+
+
+def cmd_pkgs(n):
+    rs = {s["num"]: s for s in root_snaps()}
+    if n not in rs: sys.exit(f"no system snapshot #{n}")
+    post = next((s for s in rs.values() if s["pre"] == n), None)
+    a = rpm_list(f"/.snapshots/{n}/snapshot")
+    b = rpm_list(f"/.snapshots/{post['num']}/snapshot") if post else rpm_list("")
+    if not a: sys.exit("couldn't read the package database in that snapshot")
+    label = f"#{n} → #{post['num']}" if post else f"#{n} → now"
+    print(c(B, f"Package changes {label}"))
+    for k in sorted(set(a) | set(b)):
+        if k not in a: print(f"  {c(GRN, '+')} {k} {b[k]}")
+        elif k not in b: print(f"  {c(RED, '-')} {k} {a[k]}")
+        elif a[k] != b[k]: print(f"  {c(YEL, '~')} {k} {a[k]} → {b[k]}")
+
+
+def rel_home(path):
+    p = os.path.abspath(os.path.expanduser(path))
+    if not p.startswith("/home/"): sys.exit("only files under /home are in home snapshots (system files: snapshots undo/rollback)")
+    return p[len("/home/"):]
+
+
+def cmd_versions(path):
+    rel = rel_home(path)
+    hs = home_snaps() or []
+    seen, rows = set(), []
+    for s in reversed(hs):
+        f = f"/home/.snapshots/{s['num']}/snapshot/{rel}"
+        try: st = os.stat(f)
+        except OSError: continue
+        key = (int(st.st_mtime), st.st_size)
+        if key in seen: continue
+        seen.add(key)
+        rows.append((s, st))
+    try: cur = os.stat(f"/home/{rel}"); print(c(B, "now") + f"        {time.strftime('%a %m-%d %H:%M', time.localtime(cur.st_mtime))}  {cur.st_size:>10,} B")
+    except OSError: print(c(YEL, "now: file doesn't exist (deleted?)"))
+    for s, st in rows:
+        print(f"{c(CYN, ('#' + str(s['num'])).ljust(10))} {time.strftime('%a %m-%d %H:%M', time.localtime(st.st_mtime))}  {st.st_size:>10,} B"
+              + c(DIM, f"   (snapshot {s['date'][5:16]})"))
+    if not rows: print("no saved versions found")
+    else: print(c(DIM, f"\nrestore one:  snapshots get {path} <#>"))
+
+
+def cmd_get(path, num=None):
+    rel = rel_home(path)
+    hs = home_snaps() or []
+    cands = [s for s in reversed(hs) if os.path.lexists(f"/home/.snapshots/{s['num']}/snapshot/{rel}")]
+    if num is not None:
+        cands = [s for s in cands if s["num"] == num]
+    elif os.path.exists(f"/home/{rel}") and os.path.isfile(f"/home/{rel}"):
+        cur = os.stat(f"/home/{rel}")
+        diff = [s for s in cands if (lambda st: (int(st.st_mtime), st.st_size) != (int(cur.st_mtime), cur.st_size))(
+            os.stat(f"/home/.snapshots/{s['num']}/snapshot/{rel}"))]
+        cands = diff or cands
+    if not cands: sys.exit("not found in any home snapshot")
+    s = cands[0]
+    src = f"/home/.snapshots/{s['num']}/snapshot/{rel}"
+    dst = os.path.join(HOME, "restored", f"snapshot-{s['num']}", rel.split("/", 1)[1] if "/" in rel else rel)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dst)
+    print(c(GRN, f"✔ restored from #{s['num']} ({s['date'][5:16]}) → {dst}"))
+
+
+def cmd_create(desc):
+    desc = desc or "manual"
+    subprocess.run(["snapper", "-c", "home", "create", "-c", "number", "-d", desc], check=False)
+    print("home snapshot taken")
+    if TTY:
+        subprocess.run(["sudo", "snapper", "-c", "root", "create", "-c", "number", "-d", desc], check=False)
+        print("system snapshot taken")
+    else:
+        print(f"system snapshot needs sudo: sudo snapper -c root create -c number -d '{desc}'")
+
+
+def cmd_undo(n):
+    rs = root_snaps()
+    post = next((s for s in rs if s["pre"] == n), None)
+    if not post: sys.exit(f"#{n} isn't a pre snapshot with a matching post")
+    print(f"This reverts every system file changed between #{n} and #{post['num']} — on the running system, no reboot.")
+    print(c(DIM, "Good for undoing one bad update. If the system can't boot, use rollback instead."))
+    cmd_pkgs(n)
+    os.execvp("sudo", ["sudo", "snapper", "-c", "root", "undochange", f"{n}..{post['num']}"])
+
+
+ROLLBACK = r'''
+set -euo pipefail
+N="$1"; STAMP=$(date +%Y%m%d-%H%M)
+dev=$(findmnt -no SOURCE / | sed 's/\[.*//')
+top=/run/snapshots-top; mkdir -p "$top"
+mount -o subvolid=5 "$dev" "$top"; trap 'umount "$top"' EXIT
+[ -d "$top/root/.snapshots/$N/snapshot" ] || { echo "snapshot $N not found"; exit 1; }
+echo "• new writable root from snapshot #$N";      btrfs subvolume snapshot "$top/root/.snapshots/$N/snapshot" "$top/root.new" >/dev/null
+rmdir "$top/root.new/.snapshots" 2>/dev/null || true
+echo "• current root → root.broken-$STAMP";        mv "$top/root" "$top/root.broken-$STAMP"
+mv "$top/root.new" "$top/root"
+echo "• moving the snapshot history into the new root"; mv "$top/root.broken-$STAMP/.snapshots" "$top/root/.snapshots"
+# /boot is not in the snapshot: boot the newest kernel that has modules inside the restored root
+k=$(ls "$top/root/usr/lib/modules" | sort -V | while read v; do [ -e "/boot/vmlinuz-$v" ] && echo "$v"; done | tail -1)
+[ -n "$k" ] && grubby --set-default "/boot/vmlinuz-$k" && echo "• boot default → $k"
+echo "✔ done — reboot to run snapshot #$N. Old system kept as subvolume root.broken-$STAMP"
+'''
+
+
+def cmd_rollback(n, yes):
+    rs = {s["num"]: s for s in root_snaps()}
+    if n not in rs: sys.exit(f"no system snapshot #{n}")
+    s = rs[n]
+    print(c(B, f"Rollback the SYSTEM to snapshot #{n}") + f"  ({local(s['date'])}, {s['desc'] or s['type']})")
+    print("  • /home is NOT touched (your files stay as they are now)")
+    print("  • the current system is kept as subvolume root.broken-<date>, so this can be undone")
+    print("  • takes effect after a reboot; the boot default is set to a kernel that matches the snapshot")
+    if not yes:
+        print(c(YEL, f"\nDry run. To do it: snapshots rollback {n} --yes   (then reboot)")); return
+    os.execvp("sudo", ["sudo", "bash", "-c", ROLLBACK, "rollback", str(n)])
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else "list"
+    try:
+        if cmd in ("list", "ls"): cmd_list()
+        elif cmd == "pkgs" and len(a) > 1: cmd_pkgs(int(a[1].lstrip("#")))
+        elif cmd == "versions" and len(a) > 1: cmd_versions(a[1])
+        elif cmd == "get" and len(a) > 1: cmd_get(a[1], int(a[2].lstrip("#")) if len(a) > 2 else None)
+        elif cmd == "create": cmd_create(" ".join(a[1:]))
+        elif cmd == "undo" and len(a) > 1: cmd_undo(int(a[1].lstrip("#")))
+        elif cmd == "rollback" and len(a) > 1: cmd_rollback(int(a[1].lstrip("#")), "--yes" in a)
+        elif cmd == "gui": os.execvp("btrfs-assistant-launcher", ["btrfs-assistant-launcher"])
+        else: print(__doc__.split("usage:")[1].rstrip())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,51 @@
+#!/bin/bash
+# remote — phone access to this laptop: Tailscale + key-only SSH (Tailscale only) + mosh; `claude` from the phone
+# group: System care
+#   remote                status: Tailscale, SSH server, who is connected, firewall exposure
+#   remote phone-setup    exact steps for the Pixel Terminal app (ssh system / mosh system)
+#   remote sessions       current SSH/mosh logins + recent logins
+# Install: ~/.config/remote/install.sh (sudo, real terminal). Phone key: ~/.config/remote/phone-key.pub
+set -uo pipefail
+B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
+ok() { [ "$1" = 1 ] && echo "${G}✔${N}" || echo "${R}✘${N}"; }
+
+case "${1:-status}" in
+    status)
+        ts=0; tailscale status >/dev/null 2>&1 && ts=1
+        sd=0; [ "$(systemctl is-active sshd)" = active ] && sd=1
+        cfg=0; grep -qix "passwordauthentication no" /var/lib/remote-access/sshd-effective 2>/dev/null && grep -qix "allowagentforwarding no" /var/lib/remote-access/sshd-effective && cfg=1
+        echo "$(ok $ts) Tailscale   $( [ $ts = 1 ] && echo "$(tailscale ip -4 2>/dev/null | head -1) · name system" || echo "not connected (sudo tailscale up)")"
+        echo "$(ok $sd) SSH server  $( [ $sd = 1 ] && echo running || echo off)"
+        echo "$(ok $cfg) Hardening   $( [ $cfg = 1 ] && echo "keys only · levi only · no forwarding" || echo "not installed (~/.config/remote/install.sh)")"
+        echo "  Firewall    Wi-Fi zone: $(firewall-cmd --get-default-zone 2>/dev/null || echo ?) (no SSH) · Tailscale zone: tailnet (SSH + mosh)"
+        n=$(who | grep -c pts); echo "  Sessions    $n terminal login(s) now — remote sessions for details"
+        [ $ts = 1 ] && tailscale status 2>/dev/null | awk 'NR>1 && $1 ~ /^100\./ {print "  device      " $2 " (" $4 ")" }' | head -5 ;;
+    phone-setup)
+        cat <<EOF
+${B}On the Pixel${N}
+ 1. Install the ${B}Tailscale${N} app, sign in with the same account as this laptop, switch it on.
+ 2. In the ${B}Terminal${N} app (one time). Its Linux is a separate VM that the Tailscale APP doesn't cover,
+    so it needs its own Tailscale (it shows up as a 3rd device, pixel-terminal):
+${D}      curl -fsSL https://tailscale.com/install.sh | sh
+      sudo tailscale up --hostname=pixel-terminal        (open the login link, same account)
+      sudo apt install -y openssh-client mosh tmux
+      mkdir -p ~/.ssh && cat >> ~/.ssh/config <<'CFG'
+      Host system
+        HostName system
+        User levi
+        IdentityFile ~/.ssh/id_ed25519
+        ForwardAgent no
+        ServerAliveInterval 30
+      CFG${N}
+ 3. Connect:  ${B}ssh system${N}   (or ${B}mosh system${N}: survives Wi-Fi ↔ mobile switches and sleep)
+    You land on a status screen. Type ${B}claude${N} to talk to Claude Code on the laptop
+    (a persistent tmux session: if the phone disconnects, ssh back in and type claude to continue).
+    Leave Claude running and detach with Ctrl-b then d.
+ If "system" doesn't resolve, use the laptop's Tailscale address instead: $(tailscale ip -4 2>/dev/null | head -1 || echo "(run remote after install)")
+EOF
+        ;;
+    sessions) echo "${B}Now${N}"; who | grep pts || echo "  none"; echo "${B}Recent SSH logins${N}"
+              journalctl -u sshd --since -7d -o cat --no-pager -g 'Accepted|Failed|Invalid' 2>/dev/null | tail -10 ;;
+    -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0" ;;
+    *) echo "unknown: $1 (try: remote help)"; exit 2 ;;
+esac

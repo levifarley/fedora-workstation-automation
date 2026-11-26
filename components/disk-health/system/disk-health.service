@@ -1,0 +1,15 @@
+[Unit]
+X-Watcher-Name=disk-health
+X-Watcher-State=/home/levi/.local/state/disk-health/last-result
+X-Watcher-MaxAge=50h
+OnFailure=watcher-notify@%n.service
+Description=Daily drive health check (NVMe SMART, btrfs errors/scrub, free space, Samsung SSD)
+
+[Service]
+ExecCondition=/usr/local/bin/watcher-gate disk-health
+Type=oneshot
+Environment=HEALTH_USER=levi
+ExecStart=/usr/local/bin/disk-health
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

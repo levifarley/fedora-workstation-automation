@@ -1,0 +1,10 @@
+#!/bin/bash
+# dots pre-commit: refuse anything that looks like a secret
+# every staged file is scanned except this hook itself (it contains the patterns it searches for)
+bad=$(git diff --cached --name-only | grep -vxE '.config/dots/pre-commit|.config/claude-guard/claude-guard' | xargs -r -d '\n' git diff --cached -U0 -- | grep -E '^\+' |
+      grep -nE 'GOCSPX-|-----BEGIN [A-Z ]*PRIVATE KEY|"access_token"|"refresh_token"|ghp_[A-Za-z0-9]{20}|github_pat_|hc-ping\.com/[0-9a-f-]{20}|levi-fedora-[0-9a-f]{24}|sk-ant-' | head -5)
+if [ -n "$bad" ]; then echo "dots: blocked — this looks like a secret:"; echo "$bad"; exit 1; fi
+for f in .config/backup/restic-password .config/watcher/ntfy-topic .config/rclone/rclone.conf; do
+    git diff --cached --name-only | grep -qx "$f" && { echo "dots: blocked — $f must never be committed"; exit 1; }
+done
+exit 0

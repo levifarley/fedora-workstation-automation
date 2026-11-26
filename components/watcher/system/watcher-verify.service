@@ -1,0 +1,16 @@
+[Unit]
+X-Watcher-Name=verify
+X-Watcher-State=/home/levi/.local/state/watcher/last-verify
+X-Watcher-MaxAge=26h
+X-Watcher-Schedule=nightly, step 3 (always runs, even if backup/update failed)
+OnFailure=watcher-notify@%n.service
+Description=Daily self-check and repair: safe auto-fixes, then tests, then health check (watcher fix)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecCondition=/usr/local/bin/watcher-gate nightly
+Type=oneshot
+Environment=WATCHER_USER=levi
+ExecStart=/usr/local/bin/watcher-fix --verify
+TimeoutStartSec=6h

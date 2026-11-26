@@ -1,0 +1,18 @@
+[Unit]
+X-Watcher-Name=nightly
+X-Watcher-MaxAge=26h
+# backup/update notify on their own failures
+X-Watcher-Notify=children
+Description=Nightly maintenance: backup, then update only if the backup succeeded
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecCondition=/usr/local/bin/watcher-gate nightly
+Type=oneshot
+# Sequential: if the backup fails, the update never runs
+ExecStart=/usr/bin/systemctl start system-backup.service
+ExecStart=/usr/bin/systemctl start system-update.service
+# Step 3: verify + auto-fix ALWAYS runs, even if backup/update failed (skips itself when nightly is paused)
+ExecStopPost=/usr/bin/systemctl start --no-block watcher-verify.service
+TimeoutStartSec=12h

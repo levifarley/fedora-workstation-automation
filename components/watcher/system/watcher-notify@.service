@@ -1,0 +1,6 @@
+[Unit]
+Description=Watcher failure notification for %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/watcher-notify %i

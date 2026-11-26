@@ -1,0 +1,15 @@
+[Unit]
+X-Watcher-Name=tests
+X-Watcher-State=/home/levi/.local/state/tests/last-result
+X-Watcher-MaxAge=8d
+OnFailure=watcher-notify@%n.service
+Description=Weekly full system test suite (watcher test --full)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecCondition=/usr/local/bin/watcher-gate tests
+Type=oneshot
+ExecStart=%h/.local/bin/watcher test --full
+Nice=10
+TimeoutStartSec=1h

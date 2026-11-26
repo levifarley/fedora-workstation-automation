@@ -1,0 +1,17 @@
+#!/bin/bash
+# /usr/local/bin/watcher-gate <job> — used as ExecCondition= on scheduled jobs.
+# Exit 0 = run. Exit 1 = skip cleanly (systemd marks it skipped, not failed) because `watcher pause` paused it.
+# Markers: ~/.local/state/watcher/paused/<job|all> containing an epoch end time, or "indefinite"/"disabled".
+job="$1"; U="${WATCHER_USER:-levi}"; H=$(getent passwd "$U" | cut -d: -f6)
+for m in "$H/.local/state/watcher/paused/$job" "$H/.local/state/watcher/paused/all"; do
+    [ -f "$m" ] || continue
+    until=$(head -c 40 "$m" | tr -dc 'a-z0-9')
+    if [ "$until" = indefinite ] || [ "$until" = disabled ] || { [[ "$until" =~ ^[0-9]+$ ]] && [ "$until" -gt "$(date +%s)" ]; }; then
+        what=$([ "$until" -eq "$until" ] 2>/dev/null && date -d "@$until" '+until %a %H:%M' || echo "until resumed")
+        echo "$job is paused ($(basename "$m"), $what) — skipping this run"
+        mkdir -p "$H/.local/state/watcher/skipped"; date -Is >> "$H/.local/state/watcher/skipped/$job"
+        chown -R "$U:$U" "$H/.local/state/watcher/skipped" 2>/dev/null
+        exit 1
+    fi
+done
+exit 0

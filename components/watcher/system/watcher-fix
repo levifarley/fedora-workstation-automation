@@ -1,0 +1,315 @@
+#!/usr/bin/python3 -I
+"""watcher-fix — safe automatic repairs, then verify (runs as root via watcher-verify.service).
+
+  watcher-fix --verify    fix → tests (quick) → watcher check → daily report
+                          as root (nightly step 3): applies routine root fixes itself
+                          as the user (`watcher fix`): applies user-level fixes; root fixes go into a sudo script to approve
+  watcher-fix --dry-run   show what would be fixed, change nothing (any user)
+Sensitive root actions (re-installing changed root scripts) ALWAYS go to the sudo script:
+  ~/.local/state/watcher/needs-sudo.sh  (run with: bash ~/.local/state/watcher/needs-sudo.sh)
+
+Only applies known-safe, idempotent fixes. Everything else is reported for a human (or Claude via /watcher fix).
+Root-owned copy at /usr/local/bin/watcher-fix, installed from ~/.config/watcher/system/ by ~/.config/watcher/install.sh.
+It never executes user-writable code as root: user-side steps run as the user via runuser.
+"""
+import glob, json, os, pwd, re, subprocess, sys, time
+
+USER = os.environ.get("WATCHER_USER", "levi")
+PW = pwd.getpwnam(USER)
+HOME, UID = PW.pw_dir, PW.pw_uid
+STATE = f"{HOME}/.local/state/watcher"
+DRY = "--dry-run" in sys.argv
+ROOT = os.geteuid() == 0
+USER_BUS = os.path.exists(f"/run/user/{UID}/bus")
+fixed, unresolved, notes, sudo_queue = [], [], [], []
+
+
+def log(m): print(f"[{time.strftime('%F %T')}] {m}", flush=True)
+
+
+def run(args, timeout=600, user=False):
+    if user and ROOT:
+        args = ["runuser", "-u", USER, "--", "env", f"HOME={HOME}", f"XDG_RUNTIME_DIR=/run/user/{UID}",
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{UID}/bus", f"PATH={HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"] + args
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, "", "timeout")
+
+
+def fix(what, action, root=False, cmds=None, always_ask=False):
+    """Apply one fix. root=True fixes need root: applied directly when running as root (nightly),
+    otherwise queued as sudo commands for Levi to approve. always_ask=True queues even as root."""
+    if DRY:
+        log(f"would fix: {what}" + (" (needs sudo)" if root else "")); fixed.append(f"(dry-run) {what}"); return True
+    if root and (always_ask or not ROOT):
+        log(f"needs your approval (sudo): {what}"); sudo_queue.append((what, cmds or [])); return False
+    log(f"fixing: {what}")
+    try: ok = action()
+    except Exception as e: ok = False; log(f"  error: {e}")
+    (fixed if ok else unresolved).append(what if ok else f"tried to fix but failed: {what}")
+    log("  ✔ fixed" if ok else "  ✘ still broken")
+    return ok
+
+
+def report(problem):
+    log(f"needs attention: {problem}"); unresolved.append(problem)
+
+
+def sysctl(scope): return ["systemctl", "--user"] if scope == "user" else ["systemctl"]
+
+
+# ---------------------------------------------------------------- watched jobs
+def jobs():
+    out = []
+    for scope, d in [("system", "/etc/systemd/system"), ("user", f"{HOME}/.config/systemd/user")]:
+        for f in glob.glob(f"{d}/*.service") + glob.glob(f"{d}/*.service.d/*.conf"):
+            if os.path.islink(f) or "@" in os.path.basename(f): continue
+            try: t = open(f).read()
+            except OSError: continue
+            k = dict(re.findall(r"^X-Watcher-(\w+)\s*=\s*(.*?)\s*$", t, re.M))
+            if "Name" not in k: continue
+            unit = os.path.basename(os.path.dirname(f))[:-2] if f.endswith(".conf") else os.path.basename(f)
+            m = re.fullmatch(r"(\d+)([smhd])", k.get("MaxAge", ""))
+            g = re.search(r"watcher-gate (\S+)", t)
+            out.append({"name": k["Name"], "scope": scope, "unit": unit, "schedule": k.get("Schedule", ""), "gate": g[1] if g else None,
+                        "rerun": k.get("Rerun", "yes") != "no",
+                        "maxage": int(m[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m[2]] if m else None})
+    return out
+
+
+def show(j, unit, *props):
+    o = run(sysctl(j["scope"]) + ["show", unit] + [f"-p{p}" for p in props], user=j["scope"] == "user").stdout
+    return dict(l.split("=", 1) for l in o.splitlines() if "=" in l)
+
+
+def last_runs(j, result=None):
+    args = ["journalctl"] + (["--user"] if j["scope"] == "user" else []) + ["-u", j["unit"], "-o", "json", "-n", "1", "-r", "--no-pager"]
+    args.append(f"JOB_RESULT={result}" if result else "JOB_TYPE=start")
+    for l in run(args, user=j["scope"] == "user").stdout.splitlines():
+        try:
+            e = json.loads(l); return int(e["__REALTIME_TIMESTAMP"]) / 1e6, e.get("JOB_RESULT")
+        except (ValueError, KeyError): pass
+    return None, None
+
+
+def paused(j):
+    for n in (j["name"], j.get("gate") or j["name"], "all"):
+        try: v = open(f"{STATE}/paused/{n}").read().strip()
+        except OSError: continue
+        if v in ("indefinite", "disabled") or (v.isdigit() and int(v) > time.time()): return True
+    return False
+
+
+def start(j, timeout=4 * 3600):
+    return run(sysctl(j["scope"]) + ["start", j["unit"]], timeout=timeout, user=j["scope"] == "user").returncode == 0
+
+
+SKIP_RERUN = {"nightly", "verify", "tests"}   # nightly = its parts are retried; verify = us; tests = we run them below
+
+
+def check_jobs():
+    js = jobs()
+    backup_ok_today = False
+    for j in js:
+        if j["scope"] == "user" and not USER_BUS:
+            notes.append(f"{j['name']}: skipped (no user session)"); continue
+        st = show(j, j["unit"], "TriggeredBy", "ActiveState")
+        if st.get("ActiveState") == "activating": continue        # running right now
+        # 1. trigger timer/path should be enabled + active (unless deliberately paused with `watcher disable`)
+        for t in st.get("TriggeredBy", "").split():
+            ts = show(j, t, "ActiveState", "UnitFileState")
+            if (ts.get("UnitFileState") != "enabled" or ts.get("ActiveState") != "active") and not paused(j):
+                fix(f"{j['name']}: trigger {t} was off — re-enabled",
+                    lambda j=j, t=t: run(sysctl(j["scope"]) + ["enable", "--now", t], user=j["scope"] == "user").returncode == 0,
+                    root=j["scope"] == "system", cmds=[f"sudo systemctl enable --now {t}"])
+        # 2. last run failed → retry once (dependency-aware)
+        t_last, res = last_runs(j)
+        if j["name"] == "backup" and res == "done": backup_ok_today = t_last and time.time() - t_last < 26 * 3600
+        if not j["rerun"]:
+            if res == "failed": report(f"{j['name']}: last run failed — see: watcher logs {j['name']}")
+            continue
+        if res == "failed" and j["name"] not in SKIP_RERUN:
+            if j["name"] == "update" and not backup_ok_today:
+                report("update: last run failed and there is no successful backup in the last 26h, so it was not retried"); continue
+            fix(f"{j['name']}: last run failed — re-ran it successfully", lambda j=j: start(j))
+            if j["name"] == "backup": backup_ok_today = True
+            continue
+        # 3. stale (no success within MaxAge) → run now
+        if j["maxage"] and j["name"] not in SKIP_RERUN and not paused(j):
+            t_ok, _ = last_runs(j, "done")
+            if t_ok and time.time() - t_ok > j["maxage"]:
+                fix(f"{j['name']}: no successful run in {j['maxage']//3600}h — ran it now", lambda j=j: start(j))
+
+
+def check_failed_units():
+    watched = {(j["scope"], j["unit"]) for j in jobs()}
+    for scope in ("system", "user"):
+        if scope == "user" and not USER_BUS: continue
+        out = run(sysctl(scope) + ["--failed", "--plain", "--no-legend"], user=scope == "user").stdout
+        for l in out.splitlines():
+            u = l.split()[0] if l.split() else ""
+            if not u or (scope, u) in watched or u.startswith("watcher-notify@"): continue
+            p = dict(x.split("=", 1) for x in run(sysctl(scope) + ["show", u, "-pType", "-pUnitFileState"], user=scope == "user").stdout.splitlines() if "=" in x)
+            def act(scope=scope, u=u, p=p):
+                run(sysctl(scope) + ["reset-failed", u], user=scope == "user")
+                if p.get("Type") != "oneshot" and p.get("UnitFileState") == "enabled":
+                    run(sysctl(scope) + ["restart", u], user=scope == "user"); time.sleep(3)
+                    return run(sysctl(scope) + ["is-active", u], user=scope == "user").stdout.strip() == "active"
+                return True
+            restart = p.get("Type") != "oneshot" and p.get("UnitFileState") == "enabled"
+            fix(f"{scope} unit {u} was in failed state — reset" + (" and restarted" if restart else ""), act,
+                root=scope == "system", cmds=[f"sudo systemctl reset-failed {u}"] + ([f"sudo systemctl restart {u}"] if restart else []))
+        if scope == "system" and ROOT and not DRY:   # also clear old notifier failures (root only)
+            run(["systemctl", "reset-failed", "watcher-notify@*"])
+
+
+# ---------------------------------------------------------------- system fixes (root)
+def check_system():
+    # firewall
+    if run(["systemctl", "is-active", "firewalld"]).stdout.strip() != "active":
+        fix("firewalld was not running — started", lambda: run(["systemctl", "start", "firewalld"]).returncode == 0,
+            root=True, cmds=["sudo systemctl start firewalld"])
+    # clock
+    if run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"]).stdout.strip() != "yes":
+        fix("clock was not NTP-synced — restarted chronyd", lambda: run(["systemctl", "restart", "chronyd"]).returncode == 0,
+            root=True, cmds=["sudo systemctl restart chronyd"])
+    # battery charge limits
+    b = "/sys/class/power_supply/BAT0/charge_control_"
+    if os.path.exists(b + "end_threshold") and open(b + "end_threshold").read().strip() != "80":
+        def act():
+            open(b + "end_threshold", "w").write("80"); open(b + "start_threshold", "w").write("75"); return True
+        fix("battery charge limits had reset — set back to 75–80%", act, root=True,
+            cmds=[f"echo 75 | sudo tee {b}start_threshold", f"echo 80 | sudo tee {b}end_threshold"])
+    # NVIDIA module for newest kernel
+    if run(["rpm", "-q", "xorg-x11-drv-nvidia"]).returncode == 0:
+        drv = run(["rpm", "-q", "--qf", "%{VERSION}", "xorg-x11-drv-nvidia"]).stdout.strip()
+        ks = sorted(os.listdir("/lib/modules"), key=lambda v: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", v)])
+        k = ks[-1]
+        if run(["modinfo", "-k", k, "-F", "version", "nvidia"]).stdout.strip() != drv:
+            def act():
+                run(["akmods", "--force", "--kernels", k], timeout=1800)
+                if run(["modinfo", "-k", k, "-F", "version", "nvidia"]).stdout.strip() == drv: return True
+                cur = os.uname().release
+                run(["grubby", "--set-default", f"/boot/vmlinuz-{cur}"])
+                return False
+            fix(f"NVIDIA {drv} module missing for kernel {k} — rebuilt with akmods (else boot default kept on current kernel)", act,
+                root=True, cmds=[f"sudo akmods --force --kernels {k}",
+                                 f"modinfo -k {k} -F version nvidia | grep -qx {drv} || sudo grubby --set-default /boot/vmlinuz-$(uname -r)"])
+    # disk space
+    st = os.statvfs("/")
+    if st.f_bavail / st.f_blocks < 0.10:
+        def act():
+            run(["dnf", "clean", "packages"]); run(["journalctl", "--vacuum-size=1G"])
+            s2 = os.statvfs("/"); return s2.f_bavail / s2.f_blocks >= 0.10
+        fix("/ was over 90% full — cleaned dnf package cache and old journal logs", act, root=True,
+            cmds=["sudo dnf clean packages", "sudo journalctl --vacuum-size=1G"])
+    # btrfs errors / SMART are reported, never "fixed"
+    if ROOT and run(["btrfs", "device", "stats", "-c", "/"]).returncode != 0:
+        report("btrfs reports I/O or checksum errors on / — check `watcher info disk-health`; the drive may be failing")
+
+
+# ---------------------------------------------------------------- user-side fixes
+def check_user():
+    env_ok = os.path.exists(f"{HOME}/.config/backup/env")
+    if env_ok:
+        src = f"source {HOME}/.config/backup/env && "
+        # stale restic locks (left by an interrupted run) block backups; unlock only removes stale ones
+        r = run(["bash", "-c", src + "restic list locks --no-lock 2>/dev/null | wc -l"], user=True, timeout=180)
+        if r.stdout.strip() not in ("", "0") and run(["systemctl", "is-active", "system-backup"]).stdout.strip() != "activating":
+            fix("backup repo had a leftover lock — removed stale locks (restic unlock)",
+                lambda: run(["bash", "-c", src + "restic unlock"], user=True, timeout=300).returncode == 0)
+        # Drive login still valid?
+        r = run(["bash", "-c", src + "rclone lsf --max-depth 1 \"$RCLONE_REMOTE_DIR\""], user=True, timeout=120)
+        if r.returncode != 0:
+            if re.search(r"invalid_grant|token|unauthor|401", r.stderr, re.I):
+                report("Google Drive login expired — run in a terminal: rclone config reconnect gdrive:")
+            else:
+                report(f"Google Drive unreachable: {r.stderr.strip()[-120:]}")
+        else:
+            # plain-text restore guide on Drive should match local
+            r2 = run(["bash", "-c", src + "rclone cat \"$RCLONE_REMOTE_DIR/RESTORE.md\""], user=True, timeout=120)
+            if r2.returncode == 0 and r2.stdout != open(f"{HOME}/.config/backup/RESTORE.md").read():
+                fix("RESTORE.md on Drive was out of date — uploaded the current one",
+                    lambda: run(["bash", "-c", src + "rclone copyto ~/.config/backup/RESTORE.md \"$RCLONE_REMOTE_DIR/RESTORE.md\""],
+                                user=True, timeout=120).returncode == 0)
+    # installed root scripts vs. source: reported, never auto-installed (root must not copy user-writable code)
+    pairs = [("backup/system/system-backup", "system-backup"), ("update/system/system-update", "system-update"),
+             ("disk-health/system/disk-health", "disk-health"), ("watcher/system/watcher-notify", "watcher-notify"),
+             ("watcher/system/watcher-fix", "watcher-fix")]
+    stale = [d for s, d in pairs if os.path.exists(f"{HOME}/.config/{s}") and os.path.exists(f"/usr/local/bin/{d}")
+             and open(f"{HOME}/.config/{s}", "rb").read() != open(f"/usr/local/bin/{d}", "rb").read()]
+    if stale:
+        srcs = dict((d, s) for s, d in pairs)
+        fix(f"installed root scripts differ from their source ({', '.join(stale)}) — reinstall after reviewing the diff",
+            lambda: False, root=True, always_ask=True,
+            cmds=[f"diff -u /usr/local/bin/{d} {HOME}/.config/{srcs[d]} | less -R   # review: is every change one you/Claude made?" for d in stale]
+                 + [f"{HOME}/.config/watcher/install.sh"])
+    if os.path.exists(f"{HOME}/.local/state/update/reboot-needed"):
+        notes.append("reboot recommended: " + open(f"{HOME}/.local/state/update/reboot-needed").read().strip())
+
+
+# ---------------------------------------------------------------- verify: tests + watcher check (as the user)
+def verify():
+    log("Running tests (quick suite) as " + USER)
+    t = run(["python3", "-I", f"{HOME}/.config/watcher/tests.py"], user=True, timeout=900)
+    print(t.stdout[-4000:], flush=True)
+    tests_line = (open(f"{HOME}/.local/state/tests/last-result").readline().strip()
+                  if os.path.exists(f"{HOME}/.local/state/tests/last-result") else "")
+    for l in t.stdout.splitlines():
+        if "✘" in l and "passed" not in l:
+            report("test failed: " + re.sub(r"\x1b\[[0-9;]*m", "", l).replace("✘", "").strip())
+    log("Running watcher check as " + USER)
+    c = run([f"{HOME}/.local/bin/watcher", "check"], user=True, timeout=300)
+    for l in re.sub(r"\x1b\[[0-9;]*m", "", c.stdout).splitlines():
+        l = l.strip()
+        if l.startswith("✘") or l.startswith("⚠"):
+            if re.search(r"\b(tests|verify):", l): continue          # covered above / ourselves
+            report("watcher: " + l[1:].strip())
+    return re.sub(r"^\S+\s+", "", tests_line)
+
+
+def main():
+    log("watcher-fix " + ("dry run" if DRY else "verify"))
+    check_system()
+    check_failed_units()
+    check_jobs()
+    check_user()
+    tests = "" if DRY else verify()
+    script = f"{STATE}/needs-sudo.sh"
+    if not DRY:
+        os.makedirs(STATE, exist_ok=True)
+        if sudo_queue:
+            with open(script, "w") as f:
+                f.write("#!/bin/bash\n# Written by watcher-fix " + time.strftime("%F %T") + " — fixes that need root.\n"
+                        "# Review, then run:  bash " + script + "\nset -e\n")
+                for what, cmds in sudo_queue:
+                    f.write(f"\necho '▶ {what.replace(chr(39), '')}'\n" + "\n".join(cmds) + "\n")
+                f.write(f"\necho '✔ done — run: watcher fix   (to verify)'\nrm -f {script}\n")
+            os.chmod(script, 0o755)
+            unresolved.append(f"{len(sudo_queue)} fix(es) need your approval: bash {script}")
+        elif os.path.exists(script):
+            os.remove(script)
+    status = "FAILED" if unresolved else "OK"
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {status} · {len(fixed)} fixed · {len(unresolved)} need attention" + (f" · tests: {tests}" if tests else "")
+    body = [f"  - FIXED: {x}" for x in fixed] + [f"  - TODO: {x}" for x in unresolved] + [f"  - note: {x}" for x in notes]
+    print("\n" + line + ("\n" + "\n".join(body) if body else ""), flush=True)
+    if not DRY:
+        os.makedirs(STATE, exist_ok=True)
+        with open(f"{STATE}/last-verify", "w") as f: f.write(line + "\n" + "\n".join(body) + ("\n" if body else ""))
+        os.makedirs(f"{STATE}/history", exist_ok=True)
+        with open(f"{STATE}/history/{time.strftime('%F')}.txt", "a") as f: f.write(line + "\n" + "\n".join(body) + "\n\n")
+        for p in sorted(glob.glob(f"{STATE}/history/*.txt"))[:-60]: os.remove(p)      # keep 60 days
+        if ROOT: run(["chown", "-R", f"{USER}:{USER}", STATE])
+    if not DRY and "--verify" in sys.argv:
+        # dead-man's switch: healthchecks.io alerts you if this ping stops arriving (laptop off/dead/never woke up)
+        hc = f"{HOME}/.config/watcher/healthchecks-url"
+        if os.path.exists(hc):
+            url = open(hc).read().strip()
+            if re.fullmatch(r"https://hc-ping\.com/[\w-]+(/[\w-]+)?", url):
+                run(["curl", "-fsS", "-m", "15", "--retry", "3", "--data-binary", line, url + ("/fail" if unresolved else "")], timeout=60)
+    sys.exit(1 if unresolved else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+# Sourced by system-backup and the `backup` command
+export RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf"
+export RCLONE_REMOTE_DIR="gdrive:fedora-backup"
+export RESTIC_REPOSITORY="rclone:${RCLONE_REMOTE_DIR}/restic"
+export RESTIC_PASSWORD_FILE="$HOME/.config/backup/restic-password"
+export RESTIC_CACHE_DIR="$HOME/.cache/restic"
+# Pruned data must be deleted for real — Drive trash counts against your quota
+export RCLONE_DRIVE_USE_TRASH=false
+# Be gentle with the Drive API (avoids rateLimitExceeded / 500s)
+export RCLONE_TPSLIMIT=8
+export RCLONE_TPSLIMIT_BURST=8
+export RCLONE_DRIVE_CHUNK_SIZE=64M
+export RCLONE_LOW_LEVEL_RETRIES=20

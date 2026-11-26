@@ -1,0 +1,74 @@
+#!/bin/bash
+# disk-health — daily drive check (runs as root via disk-health.service; watched job "disk-health").
+#   NVMe SMART (critical warnings, media errors, spare, wear, temp) · btrfs error counters · monthly btrfs scrub
+#   free space on / and the Samsung SSD · Samsung SSD SMART when attached (USB bridge permitting)
+# Never changes anything. Installed from ~/.config/disk-health/system/ by ~/.config/watcher/install.sh.
+set -uo pipefail
+USER_NAME="${HEALTH_USER:-levi}"
+STATE="$(getent passwd "$USER_NAME" | cut -d: -f6)/.local/state/disk-health"
+mkdir -p "$STATE"
+STATUS=OK; NOTES=(); SUMMARY=()
+log()  { echo "[$(date '+%F %T')] $*"; }
+warn() { log "WARNING: $*"; [ "$STATUS" = FAILED ] || STATUS=WARN; NOTES+=("$*"); }
+fail() { log "FAILED: $*"; STATUS=FAILED; NOTES+=("$*"); }
+
+# ---------- NVMe ----------
+for dev in /dev/nvme?n1; do
+    [ -e "$dev" ] || continue
+    j=$(smartctl -j -a "$dev" 2>/dev/null)
+    h() { jq -r ".nvme_smart_health_information_log.$1 // empty" <<<"$j"; }
+    passed=$(jq -r '.smart_status.passed // empty' <<<"$j")
+    cw=$(h critical_warning); used=$(h percentage_used); spare=$(h available_spare); spth=$(h available_spare_threshold)
+    merr=$(h media_errors); temp=$(h temperature); poh=$(h power_on_hours); unsafe=$(h unsafe_shutdowns)
+    log "$dev: passed=$passed critical_warning=$cw used=$used% spare=$spare% (thr $spth%) media_errors=$merr temp=${temp}C hours=$poh unsafe_shutdowns=$unsafe"
+    [ "$passed" = false ] && fail "$dev SMART overall health FAILED — back up and replace the drive"
+    [ -n "$cw" ] && [ "$cw" != 0 ] && fail "$dev critical warning flag $cw"
+    [ -n "$merr" ] && [ "$merr" != 0 ] && fail "$dev has $merr media (data integrity) errors"
+    [ -n "$spare" ] && [ -n "$spth" ] && [ "$spare" -le "$spth" ] && fail "$dev spare blocks at $spare% (threshold $spth%)"
+    [ -n "$used" ] && [ "$used" -ge 80 ] && warn "$dev is $used% through its rated write endurance"
+    [ -n "$temp" ] && [ "$temp" -ge 70 ] && warn "$dev running hot: ${temp}°C"
+    [ -z "$passed" ] && warn "$dev: couldn't read SMART data"
+    SUMMARY+=("NVMe ${used:-?}% worn · ${merr:-?} errors · ${temp:-?}°C")
+done
+
+# ---------- btrfs ----------
+if ! out=$(btrfs device stats -c / 2>&1); then
+    fail "btrfs reports I/O or corruption errors on /: $(grep -v ' 0$' <<<"$out" | tr -s ' ' | paste -sd';')"
+else
+    SUMMARY+=("btrfs 0 errors")
+fi
+last_scrub=$(btrfs scrub status / 2>/dev/null | awk -F': *' '/Scrub started/{print $2}')
+if [ "$(date +%d)" = 01 ] || [ -z "$last_scrub" ]; then
+    log "Monthly btrfs scrub (reads and verifies every block; a few minutes)"
+    so=$(btrfs scrub start -B / 2>&1); log "$so"
+    if grep -qi 'no errors found' <<<"$so"; then SUMMARY+=("scrub ok $(date +%m-%d)")
+    else fail "btrfs scrub found errors: $(grep -i error <<<"$so" | paste -sd';')"; fi
+else
+    SUMMARY+=("last scrub $(date -d "$last_scrub" +%m-%d 2>/dev/null || echo "$last_scrub")")
+fi
+
+# ---------- free space ----------
+pct() { df --output=pcent "$1" 2>/dev/null | tail -1 | tr -dc 0-9; }
+u=$(pct /); [ -n "$u" ] && [ "$u" -ge 90 ] && warn "/ is $u% full"
+SUMMARY+=("/ ${u}% used")
+SSD="/run/media/$USER_NAME/Samsung SSD"
+if mountpoint -q "$SSD"; then
+    s=$(pct "$SSD"); [ -n "$s" ] && [ "$s" -ge 90 ] && warn "Samsung SSD is $s% full"
+    sdev=$(findmnt -no SOURCE "$SSD" | sed 's/[0-9]*$//')
+    sj=$(smartctl -j -a -d sat "$sdev" 2>/dev/null)
+    sp=$(jq -r '.smart_status.passed // empty' <<<"$sj")
+    realloc=$(jq -r '[.ata_smart_attributes.table[]? | select(.id==5) | .raw.value][0] // empty' <<<"$sj")
+    wear=$(jq -r '[.ata_smart_attributes.table[]? | select(.id==177) | .value][0] // empty' <<<"$sj")
+    log "Samsung SSD $sdev: passed=$sp reallocated=$realloc wear_level_remaining=$wear used=$s%"
+    [ "$sp" = false ] && fail "Samsung SSD SMART health FAILED — copy the movies off now"
+    [ -n "$realloc" ] && [ "$realloc" != 0 ] && warn "Samsung SSD has $realloc reallocated sectors"
+    SUMMARY+=("Samsung ${s}% used${sp:+ · SMART ${sp/true/ok}}")
+fi
+
+{
+    echo "$(date -Is) $STATUS · $(IFS='|'; echo "${SUMMARY[*]}" | sed 's/|/ · /g')"
+    for n in "${NOTES[@]}"; do echo "  - $n"; done
+} >"$STATE/last-result"
+chown -R "$USER_NAME:$USER_NAME" "$STATE"
+log "Disk health: $STATUS"
+[ "$STATUS" != FAILED ]

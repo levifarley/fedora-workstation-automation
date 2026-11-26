@@ -1,0 +1,57 @@
+#!/bin/bash
+# update — front-end for the system update (runs nightly right after a successful backup)
+# group: System care
+#   update            update now (dnf + flatpak, NVIDIA-safe) and stream the log
+#   update check      list pending updates without installing anything
+#   update status     last result, reboot needed?, next nightly run
+#   update log        last run's full log
+#   update --backup   run a backup first, then update (what happens at midnight)
+set -uo pipefail
+B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
+UNIT=system-update.service
+STATE="$HOME/.local/state/update"
+
+run_unit() {
+    echo "${B}${C}▶ Starting system update${N} (Ctrl-C stops watching; the update keeps running)"
+    since=$(date '+%F %T')
+    journalctl -u "$UNIT" -f -n0 --since "$since" -o cat &
+    jpid=$!
+    systemctl start "$UNIT"; rc=$?
+    sleep 1; kill $jpid 2>/dev/null
+    echo
+    cat "$STATE/last-result" 2>/dev/null
+    [ -f "$STATE/reboot-needed" ] && echo "${Y}${B}↻ Reboot recommended${N} to finish applying updates"
+    if [ $rc -eq 0 ]; then echo "${G}${B}✔ Update finished${N}"; else echo "${R}${B}✘ Update failed${N} — see: update log"; fi
+    return $rc
+}
+
+case "${1:-now}" in
+    now|run) run_unit ;;
+    --backup|full)
+        "$HOME/.local/bin/backup" now || { echo "${R}Backup failed — not updating.${N}"; exit 1; }
+        run_unit ;;
+    check)
+        echo "${B}DNF${N}"; dnf check-upgrade --refresh -q 2>/dev/null || true
+        echo; echo "${B}Flatpak${N}"
+        # Fedora's OCI remote reports already-current apps as updates; hide rows whose version matches what's installed
+        awk -F'\t' 'NR==FNR{inst[$1]=$2; next} !($1 in inst) || inst[$1]!=$2' \
+            <(flatpak list --columns=application,version) \
+            <(flatpak remote-ls --updates --columns=application,version 2>/dev/null) | grep . || echo "none" 
+        echo; echo "${B}Firmware${N}"; fwupdmgr get-updates 2>/dev/null | grep -E '^\S|New version' || echo "none" ;;
+    status)
+        echo "${B}Last result${N}: $(cat "$STATE/last-result" 2>/dev/null || echo never run)"
+        [ -f "$STATE/reboot-needed" ] && echo "${Y}↻ Reboot recommended (since $(cat "$STATE/reboot-needed"))${N}"
+        newest=$(ls /lib/modules | sort -V | tail -1)
+        echo "${B}Running kernel${N}: $(uname -r)   ${B}Newest installed${N}: $newest"
+        if rpm -q xorg-x11-drv-nvidia >/dev/null 2>&1; then
+            drv=$(rpm -q --qf '%{VERSION}' xorg-x11-drv-nvidia)
+            loaded=$(cat /sys/module/nvidia/version 2>/dev/null || echo "not loaded")
+            built=$(modinfo -k "$newest" -F version nvidia 2>/dev/null || echo MISSING)
+            col=$G; [ "$loaded" != "$drv" ] || [ "$built" != "$drv" ] && col=$Y
+            echo "${B}NVIDIA${N}: ${col}driver $drv · loaded $loaded · built for $newest: $built${N}"
+        fi
+        echo; echo "${B}Nightly${N}: backup → update at 00:00"; systemctl list-timers nightly-maintenance.timer --no-pager | head -2 ;;
+    log) journalctl -u "$UNIT" -n 400 --no-pager -o short-iso | less -R +G ;;
+    -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0" ;;
+    *) echo "unknown command: $1 (try: update help)"; exit 2 ;;
+esac

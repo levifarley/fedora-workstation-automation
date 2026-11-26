@@ -1,0 +1,18 @@
+[Unit]
+X-Watcher-Name=update
+X-Watcher-State=/home/levi/.local/state/update/last-result
+X-Watcher-MaxAge=36h
+X-Watcher-Schedule=nightly, step 2 (only after a good backup)
+OnFailure=watcher-notify@%n.service
+Description=System update (dnf + flatpak, NVIDIA-safe)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=UPDATE_USER=levi
+ExecStartPre=/usr/bin/nm-online -q -t 300
+ExecStart=/usr/local/bin/system-update
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3h

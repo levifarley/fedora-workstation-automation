@@ -1,0 +1,42 @@
+#!/bin/bash
+# backup — front-end for the nightly Google Drive backup (restic + rclone)
+# group: System care
+#   backup            run a backup now (same as the midnight job) and stream its log
+#   backup status     next/last run, last result, recent snapshots
+#   backup log        last run's full log
+#   backup snapshots  list all snapshots
+#   backup ls [snap] [path]          browse files in a snapshot (default: latest)
+#   backup restore <path> [snap]     restore a file/dir from a snapshot into ~/restored/
+#   backup restic <args...>          run any restic command against the repo
+set -uo pipefail
+source "$HOME/.config/backup/env"
+B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
+UNIT=system-backup.service
+
+case "${1:-now}" in
+    now|run)
+        echo "${B}${C}▶ Starting backup${N} (Ctrl-C stops watching; the backup keeps running)"
+        since=$(date '+%F %T')
+        journalctl -u "$UNIT" -f -n0 --since "$since" -o cat &
+        jpid=$!
+        systemctl start "$UNIT"; rc=$?
+        sleep 1; kill $jpid 2>/dev/null
+        if [ $rc -eq 0 ]; then echo "${G}${B}✔ Backup finished${N}"; else echo "${R}${B}✘ Backup failed${N} — see: backup log"; fi
+        exit $rc ;;
+    status)
+        echo "${B}Timer${N}"; systemctl list-timers nightly-maintenance.timer --no-pager | head -2
+        echo; echo "${B}Last result${N}: $(cat "$HOME/.local/state/backup/last-result" 2>/dev/null || echo never run)"
+        echo; echo "${B}Recent snapshots${N}"; restic snapshots --latest 5 --compact
+        echo; restic stats --mode raw-data 2>/dev/null | grep -E 'Total Size|Snapshots' ;;
+    log)        journalctl -u "$UNIT" -b -n 300 --no-pager -o short-iso | less -R +G ;;
+    snapshots)  restic snapshots --compact ;;
+    ls)         restic ls "${2:-latest}" ${3:+"$3"} ;;
+    restore)
+        [ -z "${2:-}" ] && { echo "usage: backup restore <path> [snapshot]"; exit 2; }
+        mkdir -p "$HOME/restored"
+        restic restore "${3:-latest}" --include "$2" --target "$HOME/restored" &&
+            echo "${G}Restored into ~/restored${2}${N}" ;;
+    restic)     shift; restic "$@" ;;
+    -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0" ;;
+    *) echo "unknown command: $1 (try: backup help)"; exit 2 ;;
+esac

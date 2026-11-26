@@ -1,0 +1,97 @@
+#!/bin/bash
+# /usr/local/bin/system-update — runs as root via system-update.service.
+# Nightly it runs from nightly-maintenance.service right after a successful backup (never if the backup failed).
+# Steps: dnf upgrade → NVIDIA kmod safety check for new kernels → flatpak (system + user) → firmware check → reboot hint.
+# Never reboots. Installed from ~/.config/update/system/ by ~/.config/update/install.sh.
+set -uo pipefail
+
+USER_NAME="${UPDATE_USER:-levi}"
+USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
+STATE="$USER_HOME/.local/state/update"
+mkdir -p "$STATE"
+STATUS=OK
+NOTES=()
+
+log()  { echo "[$(date '+%F %T')] $*"; }
+warn() { log "WARNING: $*"; STATUS=WARN; NOTES+=("$*"); }
+as_user() { runuser -u "$USER_NAME" -- env HOME="$USER_HOME" XDG_RUNTIME_DIR="/run/user/$(id -u "$USER_NAME")" "$@"; }
+
+running_kernel=$(uname -r)
+run_start=$(date +%s)
+
+# ---------- 1. DNF ----------
+log "Refreshing metadata and upgrading packages (dnf)"
+dnf_ok=0
+for attempt in 1 2 3; do
+    if dnf upgrade --refresh -y; then dnf_ok=1; break; fi
+    log "dnf attempt $attempt failed (maybe locked by GNOME Software); retrying in 60s"
+    sleep 60
+done
+if [ $dnf_ok -eq 0 ]; then
+    STATUS=FAILED; NOTES+=("dnf upgrade failed")
+fi
+
+# ---------- 2. NVIDIA kernel module safety ----------
+# The module must exist AND match the installed driver version, or the next boot falls back to nouveau / breaks the GPU.
+kmod_ok() {  # $1 = kernel version
+    local v; v=$(modinfo -k "$1" -F version nvidia 2>/dev/null) || return 1
+    [ "$v" = "$drv_ver" ]
+}
+if rpm -q akmod-nvidia >/dev/null 2>&1; then
+    drv_ver=$(rpm -q --qf '%{VERSION}' xorg-x11-drv-nvidia)
+    default_after=$(grubby --default-kernel 2>/dev/null)
+    new_kver=${default_after#/boot/vmlinuz-}
+    for k in $(printf '%s\n' "$new_kver" "$running_kernel" | sort -u); do
+        [ -d "/lib/modules/$k" ] || continue
+        kmod_ok "$k" && continue
+        log "Building NVIDIA $drv_ver module for kernel $k (akmods)"
+        akmods --kernels "$k" || true
+    done
+    if kmod_ok "$new_kver"; then
+        log "NVIDIA $drv_ver module ready for boot kernel $new_kver ✔"
+    elif [ "$new_kver" != "$running_kernel" ] && kmod_ok "$running_kernel"; then
+        warn "NVIDIA module failed to build for new kernel $new_kver — boot default kept on $running_kernel"
+        grubby --set-default "/boot/vmlinuz-$running_kernel"
+    else
+        warn "NVIDIA $drv_ver module is NOT built for $new_kver — DO NOT REBOOT until fixed (sudo akmods --force --kernels $new_kver)"
+    fi
+fi
+
+# ---------- 3. Flatpak ----------
+log "Updating system Flatpaks"
+flatpak update --system -y --noninteractive || warn "system flatpak update failed"
+log "Updating user Flatpaks"
+as_user flatpak update --user -y --noninteractive || warn "user flatpak update failed"
+flatpak uninstall --system --unused -y --noninteractive >/dev/null 2>&1 || true
+
+# ---------- 4. Firmware (report only — never auto-flash) ----------
+log "Checking for firmware updates (fwupd)"
+fwupdmgr refresh --force >/dev/null 2>&1 || true
+fw=$(fwupdmgr get-updates --json 2>/dev/null | grep -o '"Name" *: *"[^"]*"' | head -5 | sed 's/.*: *"//;s/"$//' | paste -sd, -)
+if [ -n "$fw" ]; then
+    NOTES+=("Firmware updates available: $fw — install with: fwupdmgr update")
+    log "Firmware updates available: $fw"
+fi
+
+# ---------- 5. Reboot hint ----------
+rm -f "$STATE/reboot-needed"
+reboot_why=()
+dnf needs-restarting >/dev/null 2>&1 || reboot_why+=("core libraries updated")
+[ "$(grubby --default-kernel 2>/dev/null)" != "/boot/vmlinuz-$running_kernel" ] && reboot_why+=("new kernel installed")
+if [ -r /sys/module/nvidia/version ] && rpm -q xorg-x11-drv-nvidia >/dev/null 2>&1 &&
+   [ "$(cat /sys/module/nvidia/version)" != "$(rpm -q --qf '%{VERSION}' xorg-x11-drv-nvidia)" ]; then
+    reboot_why+=("NVIDIA driver $(cat /sys/module/nvidia/version) → $(rpm -q --qf '%{VERSION}' xorg-x11-drv-nvidia)")
+fi
+if [ ${#reboot_why[@]} -gt 0 ]; then
+    printf '%s (%s)\n' "$(date -Is)" "$(IFS=,; echo "${reboot_why[*]}")" >"$STATE/reboot-needed"
+    log "A reboot is recommended: ${reboot_why[*]}"
+fi
+
+{
+    pkgs=$(rpm -qa --qf '%{INSTALLTIME}\n' | awk -v s="$run_start" '$1>=s' | wc -l)
+    echo "$(date -Is) $STATUS · $pkgs packages updated${reboot_why:+ · reboot needed}"
+    for n in "${NOTES[@]}"; do echo "  - $n"; done
+} >"$STATE/last-result"
+chown -R "$USER_NAME:$USER_NAME" "$STATE"
+log "Update finished: $STATUS"
+[ "$STATUS" != FAILED ]

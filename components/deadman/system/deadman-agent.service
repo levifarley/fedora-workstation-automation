@@ -1,0 +1,13 @@
+[Unit]
+X-Watcher-Name=deadman
+X-Watcher-State=/var/lib/deadman/status.json
+X-Watcher-MaxAge=30m
+OnFailure=watcher-notify@%n.service
+Description=Remote wipe/lock/locate agent: checks for phone-signed orders (deliberately NOT pausable)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/deadman-agent
+TimeoutStartSec=10min

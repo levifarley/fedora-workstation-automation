@@ -1,0 +1,119 @@
+#!/bin/bash
+# /usr/local/bin/system-backup — nightly encrypted backup of this Fedora system to Google Drive.
+#   system-backup root-stage   (run as root by systemd ExecStartPre=+) snapshot /etc, /usr/local, rpm drift
+#   system-backup run          (run as the user) build manifest, restic backup, retention, upload RESTORE.md
+# Installed from ~/.config/backup/system/ by ~/.config/backup/install.sh. Edit there, re-run install.
+set -uo pipefail
+
+BACKUP_USER="${BACKUP_USER:-levi}"
+STAGE=/var/lib/system-backup
+
+log() { echo "[$(date '+%F %T')] $*"; }
+
+root_stage() {
+    umask 077
+    mkdir -p "$STAGE"
+    log "Archiving /etc and /usr/local"
+    tar --zstd --xattrs --selinux --acls -cpf "$STAGE/etc.tar.zst" -C / etc 2>"$STAGE/tar-errors.log"
+    tar --zstd --xattrs --selinux --acls -cpf "$STAGE/usr-local.tar.zst" -C / usr/local 2>>"$STAGE/tar-errors.log"
+    log "Listing package files changed from RPM defaults (rpm -Va)"
+    rpm -Va --nodeps --noscripts 2>/dev/null | grep -E '^..5' >"$STAGE/rpm-modified-files.txt" || true
+    cat /proc/cmdline >"$STAGE/kernel-cmdline.txt"
+    lsblk -f -o NAME,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS >"$STAGE/disks.txt" 2>&1
+    systemctl list-unit-files --state=enabled --no-pager >"$STAGE/system-services-enabled.txt"
+    command -v docker >/dev/null && docker image ls --format '{{.Repository}}:{{.Tag}}' >"$STAGE/docker-images.txt" 2>/dev/null
+    chown -R "$BACKUP_USER:$BACKUP_USER" "$STAGE"
+    chmod 700 "$STAGE"
+    log "Root stage done"
+}
+
+build_manifest() {
+    local M="$HOME/.local/share/system-manifest"
+    mkdir -p "$M"
+    log "Building system manifest in $M"
+    {
+        echo "generated: $(date -Is)"
+        echo "hostname: $(hostname)"
+        echo "kernel: $(uname -r)"
+        grep -E '^(NAME|VERSION|VERSION_ID)=' /etc/os-release
+        echo "user: $(id)"
+    } >"$M/system-info.txt"
+    dnf repoquery --userinstalled --queryformat '%{name}\n' 2>/dev/null | sort -u >"$M/dnf-userinstalled.txt"
+    dnf repolist --enabled 2>/dev/null >"$M/dnf-repos-enabled.txt"
+    dnf copr list 2>/dev/null >"$M/dnf-copr.txt"
+    flatpak remotes --columns=name,url,options 2>/dev/null >"$M/flatpak-remotes.txt"
+    flatpak list --app --columns=application,origin,installation 2>/dev/null >"$M/flatpak-apps.txt"
+    systemctl --user list-unit-files --state=enabled --no-pager >"$M/user-services-enabled.txt" 2>/dev/null
+    dconf dump / >"$M/dconf-full.ini" 2>/dev/null
+    ls "$HOME/.local/share/zed/extensions/installed" >"$M/zed-extensions.txt" 2>/dev/null
+    rpm -q zed >"$M/zed-version.txt" 2>/dev/null
+    ls "$HOME/.nvm/versions/node" >"$M/nvm-node-versions.txt" 2>/dev/null
+    command -v npm >/dev/null && npm ls -g --depth=0 >"$M/npm-global.txt" 2>/dev/null
+    pip list --user 2>/dev/null >"$M/pip-user.txt"
+    crontab -l >"$M/crontab.txt" 2>/dev/null
+    cp "$HOME/.config/backup/RESTORE.md" "$M/RESTORE.md"
+}
+
+run_backup() {
+    # shellcheck source=/dev/null
+    source "$HOME/.config/backup/env"
+    local state="$HOME/.local/state/backup"
+    mkdir -p "$state"
+
+    log "Waiting for network"
+    nm-online -q -t 300 || { log "No network after 5 min"; echo "$(date -Is) FAILED (no network)" >"$state/last-result"; exit 1; }
+
+    build_manifest
+
+    log "Running restic backup -> $RESTIC_REPOSITORY"
+    local paths=("$HOME")
+    [ -d "$STAGE" ] && paths+=("$STAGE")
+    # Retry up to 3 times: Drive throws transient 500s; restic reuses data already uploaded
+    local attempt rc=1
+    for attempt in 1 2 3; do
+        rc=0
+        restic -o rclone.connections=2 backup "${paths[@]}" \
+            --one-file-system \
+            --exclude-caches \
+            --exclude-file "$HOME/.config/backup/excludes" \
+            --tag nightly \
+            --host "$(hostname)" \
+            --verbose=1 || rc=$?
+        [ $rc -eq 0 ] || [ $rc -eq 3 ] && break
+        log "restic backup attempt $attempt failed (exit $rc); retrying in 2 min"
+        restic unlock || true
+        sleep 120
+    done
+    # restic exit 3 = some files unreadable (still a valid snapshot)
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+        log "restic backup failed (exit $rc)"
+        echo "$(date -Is) FAILED (restic exit $rc)" >"$state/last-result"
+        exit 1
+    fi
+
+    log "Applying retention: 7 daily, 4 weekly, 12 monthly"
+    local prune=()
+    [ "$(date +%u)" = 7 ] && prune=(--prune --max-unused 10%)   # prune Sundays only
+    restic -o rclone.connections=2 forget --host "$(hostname)" --keep-daily 7 --keep-weekly 4 --keep-monthly 12 "${prune[@]}" \
+        || log "WARNING: restic forget/prune failed (snapshot itself is fine)"
+
+    if [ "$(date +%d)" = 01 ]; then
+        log "Monthly integrity check (5% of data)"
+        restic check --read-data-subset=5% || log "WARNING: restic check reported problems"
+    fi
+
+    # Plain-text restore guide next to the encrypted repo, readable without the password
+    rclone copyto "$HOME/.config/backup/RESTORE.md" "${RCLONE_REMOTE_DIR}/RESTORE.md"
+
+    local info
+    info=$(restic snapshots latest --json 2>/dev/null | jq -r '.[0] | "snapshot \(.short_id) · +\((.summary.data_added // 0) / 1048576 | floor) MiB new · \((.summary.total_files_processed // 0)) files"' 2>/dev/null)
+    echo "$(date -Is) OK${info:+ · $info}" >"$state/last-result"
+    date +%s >"$state/last-success"
+    log "Backup complete"
+}
+
+case "${1:-}" in
+    root-stage) root_stage ;;
+    run) run_backup ;;
+    *) echo "usage: $0 {root-stage|run}" >&2; exit 2 ;;
+esac

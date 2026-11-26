@@ -1,0 +1,232 @@
+#!/usr/bin/python3 -I
+"""claude-guard — audit + guard for every Claude Code action (installed root-owned at /usr/local/bin/claude-guard).
+
+Wired in by /etc/claude-code/managed-settings.json (SessionStart + PreToolUse hooks, allowManagedHooksOnly), so Claude
+cannot remove or override it without Levi's sudo. Every action is logged to the system journal (tag: claude-audit),
+which Claude can read but not edit. View with: watcher claude.
+
+  deny  → blocked, Claude is told why (shown in the Claude Code UI)
+  ask   → Levi must approve in the Claude Code prompt
+  Desktop notification + email ONLY for SERIOUS categories (guard tampering, deadman, secrets, disk destruction, guard
+  errors). Routine blocks/asks (git, network, config edits…) go to the journal only: watcher claude.
+  log   → everything else is allowed (normal permissions apply) and logged
+If this script itself fails, the action is denied (fail closed).
+Pause (Levi only, sudo): `watcher guard pause [30m|2h]` / `watcher guard resume`. While paused, everything is still LOGGED and
+anti-tamper rules still apply; only blocking/asking is suspended. The pause expires by itself (/etc/claude-code/guard-paused-until).
+Emergency off-switch:  sudo rm /etc/claude-code/managed-settings.json
+"""
+import json, os, re, subprocess, sys, time
+
+HOME = os.path.expanduser("~")
+GUARD_FILES = ("/usr/local/bin/claude-guard", "/etc/claude-code", "managed-settings.json", "guard-paused-until")
+PAUSE_FILE = "/etc/claude-code/guard-paused-until"
+SERIOUS = {"tamper", "deadman", "secret", "destroy", "guard-error"}   # the only categories that notify (desktop + email)
+
+
+def paused_until():
+    """Epoch until which the guard is paused, if a valid root-owned pause file exists."""
+    try:
+        st = os.stat(PAUSE_FILE)
+        if st.st_uid != 0 or st.st_mode & 0o022: return None      # only a root-written pause counts
+        u = int(open(PAUSE_FILE).read().strip())
+        return u if u > time.time() else None
+    except (OSError, ValueError):
+        return None
+
+SECRETS = [
+    r"restic-password", r"\.config/rclone", r"rclone\.conf", r"ntfy-topic", r"healthchecks-url",
+    r"\.ssh/id_", r"\.ssh/.*key", r"\.gnupg/private", r"keyrings/", r"\.dotfiles",
+    r"google-chrome/[^ ]*(Login Data|Cookies|Web Data)", r"\.mozilla/.*(logins\.json|key4\.db|cookies)",
+    r"\.claude/\.credentials", r"\.config/gh/hosts\.yml",
+]
+ALLOWED_POST_HOSTS = ("ntfy.sh", "hc-ping.com")
+SENSITIVE_SITES = r"(mail\.google|accounts\.google|myaccount\.google|github\.com/settings|claude\.ai/settings|bank|paypal|venmo|" \
+                  r"chase\.com|wellsfargo|capitalone|amex|coinbase|password|1password|bitwarden|proton\.me/(mail|pass))"
+PROTECTED_EDITS = [r"/\.claude/settings(\.local)?\.json$", r"/\.bashrc(\.d/.*)?$", r"/\.bash_profile$", r"/\.profile$",
+                   r"/\.config/systemd/user/", r"/\.config/autostart/", r"/\.config/claude-guard/", r"/\.config/dots/",
+                   r"/\.config/watcher/system/", r"^/etc/", r"^/usr/"]
+SEG_SPLIT = re.compile(r"\|\||&&|;|\||\$\(|`|\(|\)|\n")
+WRAPPERS = {"sudo", "env", "nice", "ionice", "time", "command", "exec", "nohup", "xargs", "timeout", "doas", "runuser", "stdbuf", "flatpak-spawn"}
+
+
+def redact(s):
+    s = re.sub(r"(GOCSPX-|ghp_|github_pat_|sk-ant-)[A-Za-z0-9_-]+", r"\1***", s)
+    return s[:400]
+
+
+def journal(level, rec):
+    msg = json.dumps(rec, ensure_ascii=False)
+    subprocess.run(["logger", "-t", "claude-audit", "-p", f"user.{level}", "--", msg], timeout=5)
+
+
+def alert(title, body):
+    """Desktop + email (through /usr/local/bin/watcher-alert). Email gets the category only — never command contents."""
+    try:
+        subprocess.Popen(["notify-send", "-u", "critical", "-a", "Claude guard", "-i", "security-high", title, body[:200]],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        if os.path.exists("/usr/local/bin/watcher-alert"):
+            subprocess.Popen(["/usr/local/bin/watcher-alert", title, "Details on the laptop: watcher claude"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        pass
+
+
+def commands_in(cmd):
+    """First word of every command segment, unwrapping sudo/env/xargs and recursing into bash -c '...'."""
+    out = []
+    for seg in SEG_SPLIT.split(cmd):
+        words = seg.strip().split()
+        while words and (re.match(r"^\w+=", words[0]) or words[0] in WRAPPERS):
+            w = words.pop(0)
+            if w in ("xargs", "timeout", "sudo", "nice", "ionice", "stdbuf", "env", "runuser"):
+                while words and (words[0].startswith("-") or re.fullmatch(r"\d+[smhd]?", words[0]) or words[0] in ("-u", "--")):
+                    flag = words.pop(0)
+                    if flag in ("-u", "-n", "-c", "-I") and words and not words[0].startswith("-"): words.pop(0)
+        if not words: continue
+        first = os.path.basename(words[0].strip("'\""))
+        out.append((first, words[1:]))
+        if first in ("bash", "sh", "zsh", "dash") and "-c" in words:
+            i = words.index("-c")
+            out += commands_in(" ".join(words[i + 1:]).strip("'\""))
+        if first in ("python3", "python", "perl", "ruby", "node") and any(w in ("-c", "-e") for w in words):
+            # scripting one-liners: look for subprocess calls to git/gh inside
+            for m in re.finditer(r"""["'\[]\s*["']?(git|gh)["']\s*[,\]]|os\.system\(\s*["'](git|gh)\s""", cmd):
+                out.append((m[1] or m[2], []))
+    return out
+
+
+def decide(ev):
+    tool = ev.get("tool_name", "")
+    ti = ev.get("tool_input", {}) or {}
+    cmd = ti.get("command", "") if isinstance(ti.get("command"), str) else ""
+    path = ti.get("file_path") or ti.get("path") or ti.get("notebook_path") or ""
+    url = ti.get("url", "") or ""
+    text = " ".join(x for x in (cmd, path, url, ti.get("pattern", "") if tool in ("Grep", "Glob") else "") if x)
+
+    # --- tampering with the guard / managed settings
+    if any(g in text for g in GUARD_FILES) and (tool in ("Write", "Edit", "NotebookEdit") or re.search(
+            r"\b(rm|mv|cp|tee|chmod|chown|chattr|install|ln|truncate|dd|unlink)\b|\bsed\s+-i|>>?\s*\S*(claude-guard|claude-code|managed-settings)", cmd)):
+        return "deny", "tamper", "changing the Claude guard or managed settings is reserved for Levi (sudo, real terminal)"
+    if cmd and re.search(r"watcher\s+guard\s+(pause|resume|off)", cmd):
+        return "deny", "tamper", "only Levi can pause or resume the guard (watcher guard, in his own terminal)"
+    if cmd and re.search(r"journalctl\s+.*--(vacuum|rotate|flush)|logger\s+.*(claude-audit|-t\s+deadman)|disableAllHooks", cmd):
+        return "deny", "tamper", "clearing or forging the audit log / disabling hooks is not allowed"
+
+    # --- deadman (remote wipe): only Levi's phone may order it; Claude can't arm, sign, trigger or imitate any of it
+    if "/etc/deadman" in text or (tool in ("Write", "Edit", "NotebookEdit") and "/deadman/" in path and "/system/" in path):
+        return "deny", "deadman", "the remote-wipe trust store and agent source are Levi's only"
+    if cmd:
+        for first, args in commands_in(cmd):
+            a = " ".join(args)
+            if first == "deadman-agent" and not re.fullmatch(r"\s*--(selftest|locate)\s*", a):
+                return "deny", "deadman", "running the remote-wipe agent is reserved for its timer"
+            if first == "deadman" and args and args[0] in ("arm", "phone-setup"):
+                return "deny", "deadman", f"`deadman {args[0]}` is for Levi only (real terminal)"
+            if first == "deadman-order":
+                return "deny", "deadman", "remote orders come only from Levi's phone"
+            if first == "ssh-keygen" and re.search(r"(^|\s)-Y\s*sign", a):
+                return "deny", "deadman", "Claude never signs anything with SSH keys"
+            if first == "cryptsetup" and re.search(r"\b(erase|luksErase|luksKillSlot|luksRemoveKey|luksFormat|reencrypt)\b", a):
+                return "deny", "destroy", "destroying or changing disk encryption keys is never Claude's call"
+            if first in ("wipefs", "blkdiscard", "sgdisk", "sfdisk", "fdisk", "parted") or first.startswith("mkfs"):
+                return "deny", "destroy", f"`{first}` can destroy disks"
+            if first in ("dd", "shred") and re.search(r"(of=|\s)/dev/(sd|nvme|vd|mapper|dm-)", " " + a):
+                return "deny", "destroy", "writing directly to a disk device"
+            if first == "passwd" and re.search(r"(^|\s)-(l|d|u)\b", a):
+                return "deny", "deadman", "locking/unlocking accounts is a deadman action, phone-ordered only"
+            if first == "tailscale" and args and args[0] in ("logout", "down"):
+                return "ask", "remote", "disconnects your phone's access to this laptop"
+
+    # --- git / GitHub
+    if cmd:
+        for first, args in commands_in(cmd):
+            if first in ("git", "gh"):
+                return "deny", "git", f"Claude has no git/GitHub access (`{first}`); Levi runs git himself"
+            if first == "dots" and args and args[0] in ("save", "git", "remote", "restore", "track"):
+                return "deny", "git", f"`dots {args[0]}` changes the git repo; Levi runs it himself"
+        if re.search(r"--git-dir|GIT_DIR=|\.dotfiles|api\.github\.com|github\.com/.+\.git", cmd):
+            return "deny", "git", "touches the git repo / GitHub directly"
+
+    # --- secrets
+    if tool in ("Read", "Grep", "Glob", "Bash", "Edit", "Write", "NotebookEdit"):
+        for s in SECRETS:
+            if re.search(s, text):
+                return "deny", "secret", f"access to a secret ({s.replace(chr(92), '')}) is blocked"
+
+    # --- browser: every action is asked (managed permission rule) — flag sensitive sites
+    if tool.startswith("mcp__claude-in-chrome__") or tool.startswith("mcp__Claude_Browser__"):
+        if url and re.search(SENSITIVE_SITES, url, re.I):
+            return "ask", "browser-sensitive", f"browser wants a sensitive site: {url[:120]}"
+        if tool.endswith(("javascript_tool", "form_input", "file_upload")):
+            return "ask", "browser-active", f"browser {tool.rsplit('__', 1)[-1]} (runs code / fills forms / uploads)"
+        return "log", "browser", url[:200] or tool.rsplit("__", 1)[-1]
+
+    if cmd:
+        firsts = commands_in(cmd)
+        names = {f for f, _ in firsts}
+        # --- data leaving the machine
+        for first, args in firsts:
+            if first in ("curl", "wget"):
+                joined = " ".join(args)
+                sends = re.search(r"(^|\s)(-d|--data\S*|-F|--form\S*|-T|--upload-file|--post-\S+|-X\s*(POST|PUT|PATCH))(\s|=|$)", joined)
+                hosts = re.findall(r"https?://([^/\s'\"]+)", joined)
+                if sends and not all(h.endswith(ALLOWED_POST_HOSTS) for h in hosts):
+                    return "ask", "exfil", f"sends data to {', '.join(hosts) or 'a remote host'}"
+            if first in ("nc", "ncat", "netcat", "socat", "scp", "sftp", "ssh", "rsync") and (first != "rsync" or re.search(r"\S+:\S*", " ".join(args))):
+                return "ask", "network", f"`{first}` opens a remote connection"
+        # --- weakening the watchdogs
+        if re.search(r"systemctl\s+(--user\s+)?(stop|disable|mask|kill)\b", cmd) or "watcher disable" in cmd or "watcher pause" in cmd:
+            return "ask", "watchdog", "stops/disables/pauses a service or watched job"
+        if re.search(r"firewall-cmd\s+.*--(add|remove|set|new|delete|panic)", cmd) or "crontab" in names:
+            return "ask", "system", "changes the firewall or crontab"
+        if "sudo" in cmd.split():
+            return "log", "sudo", redact(cmd)
+    # --- edits to startup / config that would persist
+    if tool in ("Write", "Edit", "NotebookEdit") and any(re.search(p, path) for p in PROTECTED_EDITS):
+        return "ask", "config", f"edits {path.replace(HOME, '~')}"
+    return "log", "", ""
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        ev = json.loads(raw or "{}")
+    except ValueError:
+        ev = {}
+    hook = ev.get("hook_event_name", "PreToolUse")
+    sid = (ev.get("session_id") or "")[:8]
+    if hook == "SessionStart":
+        journal("info", {"sid": sid, "ev": "session-start", "cwd": ev.get("cwd", ""), "src": ev.get("source", "")})
+        return
+    if hook != "PreToolUse":
+        return
+    try:
+        verdict, cat, why = decide(ev)
+    except Exception as e:
+        verdict, cat, why = "deny", "guard-error", f"claude-guard error ({type(e).__name__}); failing closed"
+    pu = paused_until()
+    if pu and verdict in ("deny", "ask") and cat != "tamper":
+        verdict, cat, why = "log", f"paused:{cat}", f"(guard paused until {time.strftime('%H:%M', time.localtime(pu))}) {why}"
+    ti = ev.get("tool_input", {}) or {}
+    detail = ti.get("command") or ti.get("file_path") or ti.get("url") or ti.get("pattern") or ""
+    rec = {"sid": sid, "ev": "tool", "tool": ev.get("tool_name", ""), "act": verdict, "cat": cat, "why": why[:200],
+           "detail": redact(str(detail))}
+    journal("warning" if verdict != "log" else "info", rec)
+    if verdict == "log":
+        return
+    title = {"deny": "🛡 Claude blocked", "ask": "🛡 Claude needs approval"}[verdict] + f": {cat}"
+    if cat in SERIOUS:
+        alert(title, why)
+    print(json.dumps({
+        "hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": verdict,
+                               "permissionDecisionReason": f"claude-guard: {why}"},
+        "systemMessage": f"{title} — {why}",
+    }))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                 "permissionDecisionReason": f"claude-guard crashed ({e}); failing closed"}}))

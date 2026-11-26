@@ -1,0 +1,141 @@
+#!/bin/bash
+# rehearsal — prove the restore works: rebuild this setup from the Drive backup inside a throwaway VM (shows up in Boxes)
+# group: System care
+#   rehearsal prepare     download Fedora 45 Cloud (checksum-verified), create the VM "restore-rehearsal" (no sudo)
+#   rehearsal start       boot it and wait until it answers
+#   rehearsal secrets     YOU run this: copies the Drive login + restic password into the VM (Claude is blocked from them)
+#   rehearsal run         run `system-restore --rehearsal` inside the VM and follow its progress
+#   rehearsal status      which restore phases are done
+#   rehearsal report      notes, missing packages, and the in-VM test results
+#   rehearsal unlock      locked out of the VM (firewall)? re-open SSH via cloud-init and power-cycle it
+#   rehearsal push <file> copy a fixed file from ~ into the VM (same path)
+#   rehearsal ssh [cmd]   shell (or one command) inside the VM
+#   rehearsal view        open Boxes to watch the VM's screen
+#   rehearsal stop        shut it down
+#   rehearsal destroy     delete the VM and its disk (the downloaded base image is kept for next time)
+# The VM never writes to Drive/GitHub or sends phone alerts (system-restore --rehearsal pauses all jobs and removes those logins).
+set -uo pipefail
+NAME=restore-rehearsal
+DIR="$HOME/.local/share/rehearsal"          # its own btrfs subvolume: excluded from snapshots and the Drive backup
+IMG_URL="https://download.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/x86_64/images"
+IMG="Fedora-Cloud-Base-Generic-45-1.4.x86_64.qcow2"; SUMS="Fedora-Cloud-45-1.4-x86_64-CHECKSUM"
+PORT=2222; KEY="$HOME/.config/rehearsal/vm_ed25519"
+V() { virsh --connect qemu:///session "$@"; }
+SSH() { ssh -i "$KEY" -p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=5 levi@127.0.0.1 "$@"; }
+SCP() { scp -i "$KEY" -P $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR "$@"; }
+B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
+
+prepare() {
+    if [ ! -d "$DIR" ]; then
+        btrfs subvolume create "$DIR" >/dev/null 2>&1 || mkdir -p "$DIR"
+        chattr +C "$DIR" 2>/dev/null   # no copy-on-write for VM disks
+    fi
+    mkdir -p "$(dirname "$KEY")"
+    [ -f "$KEY" ] || ssh-keygen -q -t ed25519 -N '' -C rehearsal-vm -f "$KEY"
+    if [ ! -f "$DIR/$IMG.verified" ]; then
+        echo "${B}Downloading $IMG (~500 MB)${N}"
+        curl -fL --progress-bar -o "$DIR/$IMG" "$IMG_URL/$IMG" || return 1
+        curl -fsSL -o "$DIR/$SUMS" "$IMG_URL/$SUMS" || return 1
+        (cd "$DIR" && grep "SHA256 ($IMG)" "$SUMS" | sha256sum -c --quiet) || { echo "${R}checksum mismatch — deleted${N}"; rm -f "$DIR/$IMG"; return 1; }
+        touch "$DIR/$IMG.verified"; echo "${G}✔ image verified${N}"
+    fi
+    V dominfo $NAME >/dev/null 2>&1 && { echo "VM already exists (rehearsal destroy to start over)"; return 0; }
+    qemu-img create -q -f qcow2 -b "$DIR/$IMG" -F qcow2 "$DIR/$NAME.qcow2" 80G
+    local seed="$DIR/seed"; rm -rf "$seed"; mkdir -p "$seed"
+    cat >"$seed/user-data" <<EOF
+#cloud-config
+hostname: fedora-rehearsal
+users:
+  - name: levi
+    gecos: Levi (rehearsal)
+    groups: [wheel]
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys: ["$(cat "$KEY.pub")"]
+growpart: {mode: auto, devices: ["/"]}
+resize_rootfs: true
+runcmd:
+  - [loginctl, enable-linger, levi]
+EOF
+    echo "instance-id: $NAME-$(date +%s)" >"$seed/meta-data"
+    genisoimage -quiet -output "$DIR/seed.iso" -volid cidata -joliet -rock "$seed/user-data" "$seed/meta-data"
+    cat >"$DIR/$NAME.xml" <<EOF
+<domain type='kvm'>
+  <name>$NAME</name>
+  <title>Restore rehearsal (throwaway)</title>
+  <memory unit='GiB'>8</memory>
+  <vcpu>4</vcpu>
+  <os><type arch='x86_64' machine='q35'>hvm</type><boot dev='hd'/></os>
+  <features><acpi/><apic/></features>
+  <cpu mode='host-passthrough'/>
+  <devices>
+    <disk type='file' device='disk'><driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='$DIR/$NAME.qcow2'/><target dev='vda' bus='virtio'/></disk>
+    <disk type='file' device='cdrom'><driver name='qemu' type='raw'/>
+      <source file='$DIR/seed.iso'/><target dev='sda' bus='sata'/><readonly/></disk>
+    <interface type='user'><backend type='passt'/>
+      <portForward proto='tcp' address='127.0.0.1'><range start='$PORT' to='22'/></portForward>
+      <model type='virtio'/></interface>
+    <serial type='pty'/><console type='pty'/>
+    <graphics type='spice' autoport='yes'><listen type='none'/></graphics>
+    <video><model type='virtio'/></video>
+    <rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>
+  </devices>
+</domain>
+EOF
+    V define "$DIR/$NAME.xml" >/dev/null && echo "${G}✔ VM '$NAME' defined (8 GB RAM, 4 CPUs, 80 GB disk) — next: rehearsal start${N}"
+}
+
+wait_ssh() {
+    echo -n "waiting for the VM to answer"
+    for _ in $(seq 1 90); do SSH true 2>/dev/null && { echo " ${G}✔${N}"; return 0; }; echo -n .; sleep 4; done
+    echo " ${R}timed out${N} (rehearsal view to see its screen)"; return 1
+}
+
+case "${1:-help}" in
+    prepare) prepare ;;
+    start)   [ "$(V domstate $NAME 2>/dev/null)" = running ] || V start $NAME >/dev/null; wait_ssh &&
+             SSH 'cloud-init status --wait >/dev/null 2>&1; echo "  $(hostname) · $(. /etc/os-release; echo $PRETTY_NAME) · $(df -h / | awk "NR==2{print \$2}") disk"' ;;
+    secrets)
+        [ -t 0 ] && [ -t 1 ] || { echo "Run this yourself in a terminal (it copies your Drive login + restic password into the VM)."; exit 1; }
+        read -rp "Copy your Drive login and restic password into the rehearsal VM? [y/N] " a; [ "$a" = y ] || exit 0
+        SSH 'mkdir -p ~/.config/rclone ~/.config/backup && chmod 700 ~/.config/rclone ~/.config/backup'
+        SCP "$HOME/.config/rclone/rclone.conf" levi@127.0.0.1:.config/rclone/rclone.conf &&
+        SCP "$HOME/.config/backup/restic-password" levi@127.0.0.1:.config/backup/restic-password &&
+        SSH 'chmod 600 ~/.config/rclone/rclone.conf ~/.config/backup/restic-password' && echo "${G}✔ secrets copied — next: rehearsal run${N}" ;;
+    run)
+        SSH 'mkdir -p ~/.local/bin' && SCP "$HOME/.config/backup/system-restore" levi@127.0.0.1:.local/bin/system-restore || exit 1
+        SSH 'chmod +x ~/.local/bin/system-restore; test -s ~/.config/backup/restic-password' || { echo "${Y}secrets not in the VM yet — run: rehearsal secrets${N}"; exit 1; }
+        # run it as a transient systemd unit inside the VM: survives SSH disconnects, and "is it running?" is unambiguous
+        SSH 'systemctl --user is-active -q rehearsal-restore ||
+             systemd-run --user --unit=rehearsal-restore --collect --quiet \
+               bash -c "exec ~/.local/bin/system-restore --rehearsal >~/rehearsal.out 2>&1"' || exit 1
+        sleep 2
+        SSH 'systemctl --user is-active -q rehearsal-restore || test -s ~/rehearsal.out' ||
+            { echo "${R}restore did not start${N}"; SSH 'journalctl --user -u rehearsal-restore -n 20 --no-pager'; exit 1; }
+        echo "${B}restore running inside the VM — following its log (Ctrl-C just stops watching; it keeps running)${N}"
+        SSH 'pid=$(systemctl --user show -p MainPID --value rehearsal-restore); tail -n +1 -f ~/rehearsal.out --pid=${pid:-1} 2>/dev/null; echo; tail -3 ~/rehearsal.out' ;;
+    status)  SSH '~/.local/bin/system-restore --list' ;;
+    report)
+        echo "${B}Notes${N}"; SSH 'cat ~/.local/state/system-restore/notes.txt 2>/dev/null || echo "(none)"' | sed 's/^/  • /'
+        echo "${B}Packages that didn't install${N}"; SSH 'cat ~/.local/state/system-restore/packages-missing.txt 2>/dev/null' | paste -sd' ' | fold -w 110 -s | sed 's/^/  /'
+        echo "${B}Tests inside the VM${N}"; SSH 'cat ~/.local/state/system-restore/verify-tests.txt 2>/dev/null' | sed 's/\x1b\[[0-9;]*m//g' | grep -E '✘|passed' ;;
+    unlock)  # locked out (e.g. the restored firewall dropped SSH): re-run cloud-init on next boot to re-open SSH, then power-cycle
+             sed -i "s/^instance-id: .*/instance-id: $NAME-$(date +%s)/" "$DIR/seed/meta-data"
+             grep -q 'add-service=ssh' "$DIR/seed/user-data" ||
+                 printf '%s\n' '  - [sh, -c, "firewall-cmd --permanent --zone=laptop --add-service=ssh; firewall-cmd --permanent --add-service=ssh; firewall-cmd --reload; true"]' >>"$DIR/seed/user-data"
+             genisoimage -quiet -output "$DIR/seed.iso" -volid cidata -joliet -rock "$DIR/seed/user-data" "$DIR/seed/meta-data"
+             V destroy $NAME >/dev/null 2>&1; sleep 2; V start $NAME >/dev/null && wait_ssh ;;
+    push)    shift; for f in "$@"; do              # copy files from ~ into the VM at the same path (e.g. after fixing a script)
+                 rel="$(realpath -s "$f")"; rel="${rel#$HOME/}"
+                 SSH "mkdir -p \"\$(dirname ~/$rel)\"" && SCP -p "$HOME/$rel" "levi@127.0.0.1:$rel" && echo "  → ~/$rel"
+             done ;;
+    ssh)     shift; SSH -t "$@" ;;
+    view)    (gnome-boxes >/dev/null 2>&1 &) ; echo "Boxes opened — the VM is '$NAME'" ;;
+    stop)    V shutdown $NAME ;;
+    destroy) V destroy $NAME >/dev/null 2>&1; V undefine $NAME --nvram >/dev/null 2>&1 || V undefine $NAME >/dev/null 2>&1
+             rm -f "$DIR/$NAME.qcow2" "$DIR/seed.iso" "$DIR/$NAME.xml"; rm -rf "$DIR/seed"; echo "${G}✔ VM deleted (base image kept in $DIR)${N}" ;;
+    -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0" ;;
+    *) echo "unknown: $1 (try: rehearsal help)"; exit 2 ;;
+esac

@@ -1,0 +1,23 @@
+#!/bin/bash
+# /usr/local/bin/watcher-notify <unit> — desktop notification when a watched job fails.
+# Called by watcher-notify@<unit>.service (system or user), wired in via OnFailure= on each watched unit.
+unit="${1:-unknown}"
+name="${unit%.service}"
+title="✘ ${name} failed"
+body="$(date '+%a %H:%M') — run: watcher logs ${name}"
+NOTIFY_USER="${NOTIFY_USER:-levi}"
+uid=$(id -u "$NOTIFY_USER")
+send() { notify-send -u critical -a Watcher -i dialog-error "$title" "$body"; }
+if [ "$(id -u)" -eq 0 ]; then
+    if [ -S "/run/user/$uid/bus" ]; then
+        runuser -u "$NOTIFY_USER" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            notify-send -u critical -a Watcher -i dialog-error "$title" "$body"
+    else
+        echo "$title (no desktop session; email only)"
+    fi
+else
+    send
+fi
+# Email (only the job name and time are sent) — through the one central sender
+/usr/local/bin/watcher-alert "$title" "$body" || echo "email alert failed"
+echo "$title"

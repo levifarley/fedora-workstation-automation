@@ -1,0 +1,38 @@
+# restic exclude patterns (patterns without a leading / match anywhere)
+# --- caches & trash ---
+/home/levi/.cache
+/home/levi/.local/share/Trash
+/home/levi/.npm/_cacache
+/home/levi/.nvm/.cache
+/home/levi/.var/app/*/cache
+Cache
+Code Cache
+GPUCache
+GrShaderCache
+ShaderCache
+DawnCache
+CacheStorage
+ScriptCache
+CachedData
+# --- reinstallable binaries/runtimes (listed in the manifest instead) ---
+/home/levi/.local/share/flatpak
+/home/levi/.local/share/claude/versions
+/home/levi/.local/share/zed/node
+/home/levi/.local/share/zed/languages
+/home/levi/.local/share/zed/debug_adapters
+/home/levi/.local/share/zed/external_agents
+/home/levi/.local/share/zed/hang_traces
+/home/levi/.local/share/zed/logs
+/home/levi/.local/share/containers
+# rootless Docker: images (re-pullable/rebuildable) + volumes; important volume data needs its own dump job
+/home/levi/.local/share/docker
+# never back up VS Code leftovers if they reappear
+/home/levi/.vscode*
+/home/levi/.config/Code
+node_modules
+__pycache__
+# --- sockets / volatile ---
+*.sock
+/home/levi/.local/state/backup
+# restore-rehearsal VM disks (throwaway; also its own subvolume)
+/home/levi/.local/share/rehearsal

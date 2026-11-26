@@ -1,0 +1,13 @@
+[Unit]
+Description=Nightly maintenance at midnight (backup → update)
+
+[Timer]
+OnCalendar=*-*-* 00:00:00
+# Run on next boot/wake if the machine was off at midnight
+Persistent=true
+# Wake the laptop from suspend to run it
+WakeSystem=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

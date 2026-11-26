@@ -1,0 +1,24 @@
+{
+  "allowManagedHooksOnly": true,
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "/usr/local/bin/claude-guard", "timeout": 10 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": ".*", "hooks": [ { "type": "command", "command": "/usr/local/bin/claude-guard", "timeout": 10 } ] }
+    ]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(git *)", "Bash(gh *)",
+      "Bash(dots save*)", "Bash(dots git*)", "Bash(dots remote*)", "Bash(dots restore*)", "Bash(dots track*)",
+      "Read(~/.config/backup/restic-password)", "Read(~/.config/rclone/**)", "Read(~/.ssh/**)",
+      "Read(~/.config/watcher/ntfy-topic)", "Read(~/.config/watcher/healthchecks-url)", "Read(~/.dotfiles/**)",
+      "Edit(//etc/claude-code/**)", "Edit(//usr/local/bin/claude-guard)"
+    ],
+    "ask": [
+      "mcp__claude-in-chrome",
+      "Edit(~/.claude/settings.json)", "Edit(~/.claude/settings.local.json)"
+    ]
+  }
+}

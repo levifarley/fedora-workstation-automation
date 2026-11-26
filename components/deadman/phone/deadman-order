@@ -1,0 +1,36 @@
+#!/bin/bash
+# deadman-order — runs ON THE PHONE (Pixel Terminal app). Signs an order with your deadman key and sends it to the laptop.
+#   deadman-order test      prove the chain works (changes nothing; you get a "test OK" email)
+#   deadman-order locate    email the laptop's location now
+#   deadman-order lost      email its location every 10 min until: deadman-order found
+#   deadman-order lock      lock screen, end desktop sessions, disable password logins (deadman-order unlock to undo)
+#   deadman-order scrub     delete secrets: backup password, Drive/GitHub logins, SSH keys, browser profiles; log out of Tailscale
+#   deadman-order wipe      destroy the disk encryption keys (all data unrecoverable) and power off — asks you to type a phrase
+# Setup: ~/.config/deadman/phone.conf with MACHINE=... and TOPIC=... (from `deadman phone-setup` on the laptop),
+#        key ~/.ssh/deadman_ed25519 (made with a passphrase: ssh-keygen -t ed25519 -f ~/.ssh/deadman_ed25519 -C deadman-pixel10)
+set -euo pipefail
+. "$HOME/.config/deadman/phone.conf"      # MACHINE, TOPIC, HOST
+KEY="$HOME/.ssh/deadman_ed25519"
+action="${1:-}"
+case "$action" in test|locate|lost|found|lock|unlock|scrub|wipe) ;; *) sed -n '2,10p' "$0"; exit 2 ;; esac
+confirm=""
+if [ "$action" = wipe ]; then
+    echo "This makes ALL data on $HOST permanently unrecoverable."
+    read -rp "Type  WIPE ${MACHINE:0:8}  to confirm: " confirm
+    [ "$confirm" = "WIPE ${MACHINE:0:8}" ] || { echo "not confirmed — nothing sent"; exit 1; }
+fi
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+{
+    echo "deadman-order v1"
+    echo "machine: $MACHINE"
+    echo "action: $action"
+    echo "issued: $(date +%s)"
+    echo "nonce: $(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    [ -n "$confirm" ] && echo "confirm: $confirm"
+} >"$tmp/order"
+ssh-keygen -Y sign -q -f "$KEY" -n "deadman@$HOST" "$tmp/order"      # asks for the key's passphrase
+python3 - "$tmp/order" "$tmp/order.sig" >"$tmp/msg.json" <<'PY'
+import json, sys; print(json.dumps({"order": open(sys.argv[1]).read(), "sig": open(sys.argv[2]).read()}))
+PY
+curl -fsS -m 20 --data-binary @"$tmp/msg.json" "https://ntfy.sh/$TOPIC" >/dev/null
+echo "✔ '$action' order sent. The laptop checks every 2 minutes; you'll get an email when it acts."

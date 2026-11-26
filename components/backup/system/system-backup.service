@@ -1,0 +1,20 @@
+[Unit]
+X-Watcher-Name=backup
+X-Watcher-State=/home/levi/.local/state/backup/last-result
+X-Watcher-MaxAge=36h
+X-Watcher-Schedule=nightly, step 1
+OnFailure=watcher-notify@%n.service
+Description=Nightly encrypted system backup to Google Drive (restic + rclone)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=levi
+Group=levi
+Environment=HOME=/home/levi BACKUP_USER=levi
+ExecStartPre=+/usr/local/bin/system-backup root-stage
+ExecStart=/usr/local/bin/system-backup run
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=8h

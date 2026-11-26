@@ -1,0 +1,14 @@
+[Unit]
+X-Watcher-Name=report
+X-Watcher-State=/home/levi/.local/state/watcher/last-report
+X-Watcher-MaxAge=8d
+OnFailure=watcher-notify@%n.service
+Description=Weekly system report (watcher report --notify): desktop + phone summary
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecCondition=/usr/local/bin/watcher-gate report
+Type=oneshot
+ExecStart=%h/.local/bin/watcher report --notify
+TimeoutStartSec=1h

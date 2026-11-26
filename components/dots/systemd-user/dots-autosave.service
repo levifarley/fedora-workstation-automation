@@ -1,0 +1,10 @@
+[Unit]
+X-Watcher-Name=dots
+X-Watcher-MaxAge=50h
+OnFailure=watcher-notify@%n.service
+Description=Nightly: commit (and push) any config/script changes to the dotfiles repo
+
+[Service]
+ExecCondition=/usr/local/bin/watcher-gate dots
+Type=oneshot
+ExecStart=%h/.local/bin/dots save

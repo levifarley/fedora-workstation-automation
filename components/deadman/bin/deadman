@@ -1,0 +1,124 @@
+#!/bin/bash
+# deadman — remote lock / locate / scrub / wipe of this laptop, ordered ONLY from your phone with a signed message
+# group: System care
+#   deadman                 status: agent polling, armed with your phone key, encrypted disk (needed for a real wipe), lost mode
+#   deadman where           where this laptop thinks it is right now (Wi-Fi + IP location; nothing is sent anywhere)
+#   deadman log             orders received (accepted and rejected) + away alerts sent
+#   deadman trust-here      YOU run this at home: trust this router, so being on it never sends an away alert (sudo)
+#   deadman away            away-alert state;  deadman away pause 3d (trips, max 30d)  ·  deadman away resume
+#   deadman selftest        prove the signature checks with a throwaway key (changes nothing)
+#   deadman phone-setup     YOU run this: phone steps + your private order channel (needs sudo, real terminal)
+#   deadman arm '<key>'     YOU run this: trust your phone's deadman public key (sudo, real terminal)
+# Orders are sent from the phone: deadman-order test|locate|lost|found|lock|unlock|scrub|wipe
+# Nothing on this laptop can create a valid order — Claude can't arm keys, sign, or run the agent (guard-blocked).
+set -uo pipefail
+B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
+AGENT=/usr/local/bin/deadman-agent; STATUS=/var/lib/deadman/status.json
+need_tty() { [ -t 0 ] && [ -t 1 ] || { echo "Run this yourself in a terminal (needs sudo)."; exit 1; }; }
+
+case "${1:-status}" in
+    status)
+        [ -x "$AGENT" ] || { echo "${R}✘ not installed${N} — run ~/.config/deadman/install.sh"; exit 1; }
+        if [ -r "$STATUS" ]; then
+            python3 - "$STATUS" <<'PY'
+import json, sys, time
+s = json.load(open(sys.argv[1])); age = int(time.time() - s["last_poll"])
+G, Y, R, N = "\033[32m", "\033[33m", "\033[31m", "\033[0m"
+print(f"{G+'✔' if age < 600 else R+'✘'}{N} agent      last check {age//60} min ago" + (f" — {s['note']}" if s.get("note") else ""))
+print(f"{G+'✔' if s['armed'] else Y+'!'}{N} armed      " + ("phone signing key trusted" if s["armed"] else "no phone key yet — deadman phone-setup, then deadman arm"))
+print(f"{G+'✔' if s['encrypted'] else Y+'!'}{N} encrypted  " + ("yes — wipe = crypto-erase (seconds, unrecoverable)" if s["encrypted"]
+      else "NO — wipe can only scrub secrets + power off (fixed by the encrypted reinstall)"))
+print(f"{Y+'!' if s['lost_mode'] else G+'✔'}{N} lost mode  " + ("ON — location emailed every 10 min" if s["lost_mode"] else "off"))
+a = s.get("away") or "not checked yet (agent update pending?)"
+print(f"{G+'✔' if a == 'home' else R+'✘' if a.startswith('AWAY') else Y+'!'}{N} network    " +
+      ("home (trusted router)" if a == "home" else a))
+PY
+        else echo "${Y}agent installed, hasn't run yet${N}"; fi
+        systemctl is-active -q deadman-agent.timer && echo "${D}  timer: every 2 min · orders log: deadman log${N}" ;;
+    where)   python3 -I "$AGENT" --locate ;;
+    log)     journalctl -t deadman --since -30d --no-pager -o short-iso | tail -30 ;;
+    trust-here)
+        need_tty
+        read -r gw dev < <(ip -j route show default | jq -r '[.[] | select(.gateway)] | min_by(.metric // 0) | "\(.gateway) \(.dev)"' 2>/dev/null)
+        [ -n "${gw:-}" ] && [ "$gw" != null ] || { echo "${R}Not online — connect to your home network first.${N}"; exit 1; }
+        ping -c 1 -W 2 -I "$dev" "$gw" >/dev/null 2>&1
+        mac=$(ip -j neigh show "$gw" dev "$dev" | jq -r '[.[] | select(.lladdr)][0].lladdr // empty' | tr 'A-F' 'a-f')
+        name=$(nmcli -t -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
+        [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || { echo "${R}Couldn't read the router's hardware address.${N}"; exit 1; }
+        echo "Trust this as ${B}HOME${N}? Being on it will never send an away alert."
+        echo "   ${B}${name:-$dev}${N}  router $gw  [$mac]"
+        read -rp "Only do this on your own home network. Type yes: " ans; [ "$ans" = yes ] || { echo "nothing changed"; exit 1; }
+        if sudo grep -qi "^$mac" /etc/deadman/trusted_networks 2>/dev/null; then echo "${G}✔ already trusted${N}"; exit 0; fi
+        printf '%s  %s (added %s)\n' "$mac" "${name:-$dev}" "$(date +%F)" | sudo tee -a /etc/deadman/trusted_networks >/dev/null &&
+            sudo chmod 600 /etc/deadman/trusted_networks &&
+            logger -t deadman -p auth.warning -- "home network TRUSTED by $USER: ${name:-$dev} [$mac]" &&
+            { /usr/local/bin/watcher-alert "deadman: home network trusted" "Away alerts will not fire on: ${name:-$dev} [$mac]. If this was not you, act now." || true; } &&
+            echo "${G}✔ trusted.${N} Away alerts now fire on any other network." ;;
+    away)
+        case "${2:-}" in
+            pause)
+                need_tty
+                [[ "${3:-}" =~ ^([0-9]+)([hd])$ ]] || { echo "usage: deadman away pause 12h | 3d   (max 30d)"; exit 2; }
+                unit=86400; [ "${BASH_REMATCH[2]}" = h ] && unit=3600
+                secs=$(( 10#${BASH_REMATCH[1]} * unit ))
+                (( secs > 0 && secs <= 30 * 86400 )) || { echo "between 1h and 30d"; exit 2; }
+                until=$(( $(date +%s) + secs )); when=$(date -d "@$until" '+%a %b %d %H:%M')
+                echo "$until" | sudo tee /etc/deadman/away_pause >/dev/null && sudo chmod 600 /etc/deadman/away_pause &&
+                    logger -t deadman -p auth.warning -- "away alerts PAUSED by $USER until $when" &&
+                    { /usr/local/bin/watcher-alert "deadman: away alerts paused" "Away-from-home alerts are paused until $when. If this was not you, act now." || true; } &&
+                    echo "${G}✔ away alerts paused until $when${N} (deadman away resume to end early)" ;;
+            resume)
+                need_tty
+                sudo rm -f /etc/deadman/away_pause && logger -t deadman -- "away alerts resumed by $USER" &&
+                    echo "${G}✔ away alerts on again${N}" ;;
+            "")
+                python3 -c 'import json; print("network: " + (json.load(open("/var/lib/deadman/status.json")).get("away") or "not checked yet"))' 2>/dev/null ||
+                    echo "agent hasn't run yet"
+                echo "${D}  trust home: deadman trust-here · trip: deadman away pause 3d · end pause: deadman away resume${N}" ;;
+            *) echo "usage: deadman away [pause 12h|3d | resume]"; exit 2 ;;
+        esac ;;
+    selftest) python3 -I "$AGENT" --selftest ;;
+    phone-setup)
+        need_tty
+        topic=$(sudo cat /etc/deadman/topic) || exit 1
+        # also leave the phone's settings as a file it can fetch with scp (deleted again by `deadman arm`)
+        ( umask 077; printf 'MACHINE=%s\nTOPIC=%s\nHOST=%s\n' "$(cat /etc/machine-id)" "$topic" "$(hostname)" >"$HOME/.deadman-phone.conf" )
+        echo "${G}Phone settings saved — on the phone run:${N}"
+        echo "   mkdir -p ~/.config/deadman ~/bin && scp system:.deadman-phone.conf ~/.config/deadman/phone.conf && scp system:.config/deadman/phone/deadman-order ~/bin/ && chmod +x ~/bin/deadman-order"
+        echo
+        cat <<EOF
+${B}On the phone (Terminal app), one time:${N}
+ 1. ${B}sudo apt install -y curl python3 openssh-client${N}
+ 2. Make a SEPARATE key just for deadman orders, ${B}with a passphrase${N} (it's what authorizes a wipe):
+      ssh-keygen -t ed25519 -f ~/.ssh/deadman_ed25519 -C deadman-pixel10
+ 3. Save your settings:
+      mkdir -p ~/.config/deadman ~/bin && cat > ~/.config/deadman/phone.conf <<'CFG'
+      MACHINE=$(cat /etc/machine-id)
+      TOPIC=$topic
+      HOST=$(hostname)
+      CFG
+ 4. Copy the order script to the phone (it's ~/.config/deadman/phone/deadman-order on the laptop). Easiest, once ssh works:
+      scp system:.config/deadman/phone/deadman-order ~/bin/ && chmod +x ~/bin/deadman-order
+ 5. Show the deadman PUBLIC key and bring it back to this laptop:
+      cat ~/.ssh/deadman_ed25519.pub
+    then on the laptop:  ${B}deadman arm '<that line>'${N}
+ 6. Test the whole chain:  ${B}deadman-order test${N}  → a "test OK" email within ~2 minutes.
+${D}Keep the TOPIC private (it's only a channel; orders still need your signature).${N}
+EOF
+        ;;
+    arm)
+        need_tty
+        shift; key="$*"      # accept the key quoted or unquoted
+        [[ "$key" =~ ^ssh-ed25519\ [A-Za-z0-9+/=]{60,}( .*)?$ ]] || { echo "usage: deadman arm 'ssh-ed25519 AAAA... deadman-pixel10'"; exit 2; }
+        if grep -qF "$(cut -d' ' -f2 <<<"$key")" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+            echo "${R}That's your SSH login key — use the SEPARATE deadman key (~/.ssh/deadman_ed25519.pub on the phone).${N}"; exit 1
+        fi
+        echo "deadman namespaces=\"deadman@$(hostname)\" $key" | sudo tee /etc/deadman/allowed_signers >/dev/null &&
+            sudo chmod 600 /etc/deadman/allowed_signers &&
+            logger -t deadman -p auth.warning -- "phone signing key ARMED by $USER: $(cut -d' ' -f3- <<<"$key")" &&
+            { /usr/local/bin/watcher-alert "deadman: phone key armed" "A phone signing key was trusted for remote orders. If this was not you, act now." || echo "(email alert not sent — email not set up yet)"; } &&
+            rm -f "$HOME/.deadman-phone.conf" &&
+            echo "${G}✔ armed.${N} From the phone: ~/bin/deadman-order test" ;;
+    -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0" ;;
+    *) echo "unknown: $1 (try: deadman help)"; exit 2 ;;
+esac

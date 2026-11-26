@@ -1,0 +1,71 @@
+#!/bin/bash
+# dots — version history for every config and script we built (bare git repo ~/.dotfiles, work tree = ~)
+# group: System care
+#   dots                   what changed since the last save
+#   dots diff [path]       the exact changes
+#   dots log               history (newest first)
+#   dots save ["message"]  commit all tracked changes (+ new files in tracked folders) and push if a remote is set
+#   dots track <path>      start tracking another file/folder (it's added to the list in ~/.config/dots/paths)
+#   dots restore <path> [commit]   get an older version of a file back (asks first)
+#   dots remote <url>      set the private GitHub repo to push to
+#   dots git <args...>     any git command on the repo
+# Only paths listed in ~/.config/dots/paths are tracked; secrets are excluded and a pre-commit check blocks keys/tokens.
+set -uo pipefail
+GD="$HOME/.dotfiles"
+PATHS="$HOME/.config/dots/paths"
+g() { git --git-dir="$GD" --work-tree="$HOME" "$@"; }
+
+init() {
+    [ -d "$GD" ] && return
+    git init --bare -q "$GD"
+    g config status.showUntrackedFiles no
+    g config core.excludesFile "$HOME/.config/dots/exclude"
+    install -m 755 "$HOME/.config/dots/pre-commit" "$GD/hooks/pre-commit"
+}
+
+add_tracked() {
+    local p
+    while IFS= read -r p; do
+        p="${p%%#*}"; p="$(echo "$p" | xargs)"; [ -z "$p" ] && continue
+        p="${p/#\~/$HOME}"
+        for f in $p; do
+            if [ -e "$f" ] || [ -L "$f" ]; then g add -A -- "$f" || echo "dots: couldn't add $f" >&2; fi
+        done
+    done <"$PATHS"
+    # files deleted from disk → record the deletion
+    g ls-files --deleted -z | xargs -0 -r git --git-dir="$GD" --work-tree="$HOME" rm --cached -q --
+}
+
+save() {
+    init; add_tracked
+    if g diff --cached --quiet; then echo "nothing changed"; return 0; fi
+    local msg="${1:-}"
+    [ -z "$msg" ] && msg="$(date '+%F %H:%M') auto: $(g diff --cached --name-only | sed "s|^|~/|" | head -5 | paste -sd' ' -)$( [ "$(g diff --cached --name-only | wc -l)" -gt 5 ] && echo ' …')"
+    g commit -q -m "$msg" || return 1
+    echo "saved: $(g log -1 --format='%h %s')"
+    if g remote get-url origin >/dev/null 2>&1; then g push -q origin HEAD:main && echo "pushed to $(g remote get-url origin)"; fi
+}
+
+case "${1:-status}" in
+    status)  init; add_tracked
+             (cd "$HOME" && g status --short) | while IFS= read -r l; do
+                 case "${l:0:1}" in A) c=$'\e[32m';; D) c=$'\e[31m';; *) c=$'\e[33m';; esac
+                 [ -t 1 ] || c=""; printf '%s%s\e[0m  ~/%s\n' "$c" "${l:0:1}" "${l:3}" | { [ -t 1 ] && cat || sed 's/\x1b\[0m//'; }
+             done
+             g reset -q ;;
+    diff)    init; add_tracked; g diff --cached --stat ${2:+-- "$2"}; g diff --cached ${2:+-- "$2"}; g reset -q ;;
+    log)     init; g log --format='%C(yellow)%h%C(reset) %C(dim)%ad%C(reset) %s' --date=format:'%m-%d %H:%M' -n "${2:-30}" ;;
+    save)    save "${2:-}" ;;
+    track)   [ -z "${2:-}" ] && { echo "usage: dots track <path>"; exit 2; }
+             p="$(realpath -s "$2")"; echo "${p/#$HOME/\~}" >>"$PATHS"; echo "tracking ${p/#$HOME/\~} (saved on next dots save)" ;;
+    restore) [ -z "${2:-}" ] && { echo "usage: dots restore <path> [commit]"; exit 2; }
+             f="$(realpath -s "$2")"; rel="${f#$HOME/}"
+             g diff "${3:-HEAD}" -- "$rel" | head -40
+             read -rp "Replace ~/$rel with the version from ${3:-HEAD}? [y/N] " a
+             [ "$a" = y ] && g checkout "${3:-HEAD}" -- "$rel" && echo "restored ~/$rel" ;;
+    remote)  init; [ -z "${2:-}" ] && { g remote -v; exit 0; }
+             g remote remove origin 2>/dev/null; g remote add origin "$2" && echo "remote set: $2 (next: dots save)" ;;
+    git)     init; shift; g "$@" ;;
+    -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0" ;;
+    *) echo "unknown: $1 (try: dots help)"; exit 2 ;;
+esac

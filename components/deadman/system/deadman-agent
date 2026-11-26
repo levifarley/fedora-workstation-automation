@@ -1,0 +1,379 @@
+#!/usr/bin/python3 -I
+"""deadman-agent — remote lock / locate / scrub / wipe, ordered ONLY by Levi's phone (runs as root every 2 min).
+
+Orders are short texts signed on the phone with a dedicated, passphrase-protected SSH key (`ssh-keygen -Y sign`,
+namespace deadman@<host>). This laptop holds only the PUBLIC key (/etc/deadman/allowed_signers, root-only), so nothing
+running here — Claude included — can forge an order. An order is executed only if: the signature verifies, it names this
+machine, it was issued within the last 15 minutes, its nonce was never seen before, and (for wipe) the confirmation phrase matches.
+Every order (valid or not) is logged (journal tag: deadman) and emailed.
+
+Away alert: every run also checks WHICH network the laptop is on, identified by the router's hardware (MAC) address
+(a Wi-Fi name can be copied; a router MAC is much harder to fake). If it isn't a trusted home router
+(/etc/deadman/trusted_networks, added with `deadman trust-here`), a silent high-priority email goes out with the location
+and the exact phone orders to send. Once per new network, again when it comes back online after 30+ min offline, and a
+reminder every 4 h while it stays away. Paused by `deadman away pause <time>` (trips); muted while lost mode reports anyway.
+
+  deadman-agent            poll for orders (deadman-agent.timer)
+  deadman-agent --selftest prove the verification logic with a throwaway key (changes nothing)
+  deadman-agent --locate   print a location report (no email)
+Installed from ~/.config/deadman/system/ by ~/.config/deadman/install.sh. Not pausable on purpose.
+"""
+import glob, json, os, pwd, re, secrets, subprocess, sys, tempfile, time, urllib.request
+
+USER = "levi"
+ETC, VAR = "/etc/deadman", "/var/lib/deadman"
+SIGNERS, TOPIC_F, STATE_F, STATUS_F = f"{ETC}/allowed_signers", f"{ETC}/topic", f"{ETC}/state.json", f"{VAR}/status.json"
+MACHINE = open("/etc/machine-id").read().strip()
+HOST = os.uname().nodename
+NAMESPACE = f"deadman@{HOST}"
+PRINCIPAL = "deadman"
+MAX_AGE = 15 * 60
+ACTIONS = ("test", "locate", "lost", "found", "lock", "unlock", "scrub", "wipe")
+TRUSTED_F, PAUSE_F = f"{ETC}/trusted_networks", f"{ETC}/away_pause"
+AWAY_REMIND, OFFLINE_GAP = 4 * 3600, 30 * 60
+
+
+def log(msg, level="info"):
+    print(msg, flush=True)
+    subprocess.run(["logger", "-t", "deadman", "-p", f"auth.{level}", "--", msg])
+
+
+def email(title, body):
+    subprocess.run(["/usr/local/bin/watcher-alert", f"deadman: {title}", body], capture_output=True, timeout=60)
+
+
+def run(args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, timeout=kw.pop("timeout", 120), **kw)
+
+
+# ----------------------------------------------------------------- verification (pure; used by selftest too)
+def parse(text):
+    head = text.split("\n---\n")[0]
+    fields = dict(l.split(":", 1) for l in head.splitlines()[1:] if ":" in l)
+    fields = {k.strip(): v.strip() for k, v in fields.items()}
+    return head.splitlines()[0].strip() if head else "", fields
+
+
+def verify(order_text, sig_text, signers_file, seen_nonces, now=None, machine=MACHINE, namespace=NAMESPACE):
+    """Return (ok, reason, fields). No side effects."""
+    now = now or time.time()
+    magic, f = parse(order_text)
+    if magic != "deadman-order v1": return False, "not a deadman order", f
+    with tempfile.TemporaryDirectory() as d:
+        o, s = f"{d}/order", f"{d}/order.sig"
+        open(o, "w").write(order_text); open(s, "w").write(sig_text)
+        r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", signers_file, "-I", PRINCIPAL, "-n", namespace, "-s", s],
+                           stdin=open(o), capture_output=True, text=True)
+    if r.returncode != 0: return False, "bad signature", f
+    if f.get("machine") != machine: return False, "order is for another machine", f
+    try: issued = int(f.get("issued", "0"))
+    except ValueError: return False, "bad timestamp", f
+    if abs(now - issued) > MAX_AGE: return False, f"stale or future order ({int(now - issued)}s old)", f
+    n = f.get("nonce", "")
+    if not re.fullmatch(r"[0-9a-f]{16,64}", n): return False, "bad nonce", f
+    if n in seen_nonces: return False, "replayed order (nonce already used)", f
+    if f.get("action") not in ACTIONS: return False, f"unknown action {f.get('action')!r}", f
+    if f["action"] == "wipe" and f.get("confirm") != f"WIPE {machine[:8]}":
+        return False, "wipe confirmation phrase missing or wrong", f
+    return True, "verified", f
+
+
+# ----------------------------------------------------------------- location
+def locate():
+    rep = {"host": HOST, "time": time.strftime("%F %T %Z")}
+    try:
+        aps = []
+        out = run(["nmcli", "-t", "-f", "BSSID,SIGNAL", "dev", "wifi", "list", "--rescan", "auto"]).stdout
+        for l in out.splitlines():
+            m = re.match(r"((?:[0-9A-F]{2}\\:){5}[0-9A-F]{2}):(\d+)", l)
+            if m: aps.append({"macAddress": m[1].replace("\\", "").lower(), "signalStrength": int(m[2]) // 2 - 100})
+        if len(aps) >= 2:
+            req = urllib.request.Request("https://api.beacondb.net/v1/geolocate", data=json.dumps({"wifiAccessPoints": aps[:30]}).encode(),
+                                         headers={"Content-Type": "application/json", "User-Agent": "deadman-agent"})
+            g = json.load(urllib.request.urlopen(req, timeout=20))
+            lat, lon, acc = g["location"]["lat"], g["location"]["lng"], g.get("accuracy")
+            rep["wifi_location"] = f"{lat:.5f},{lon:.5f} (±{int(acc or 0)} m) https://maps.google.com/?q={lat:.5f},{lon:.5f}"
+        rep["wifi_seen"] = len(aps)
+    except Exception as e:
+        rep["wifi_location"] = f"unavailable ({type(e).__name__})"
+    try:
+        ip = json.load(urllib.request.urlopen(urllib.request.Request("https://ipinfo.io/json", headers={"User-Agent": "deadman-agent"}), timeout=20))
+        rep["public_ip"] = f"{ip.get('ip')} · {ip.get('city')}, {ip.get('region')} {ip.get('country')} · {ip.get('org')} · ~{ip.get('loc')}"
+    except Exception as e:
+        rep["public_ip"] = f"unavailable ({type(e).__name__})"
+    rep["network"] = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"]).stdout.strip().replace("\n", "; ")
+    rep["logged_in"] = run(["who"]).stdout.strip().replace("\n", "; ") or "nobody"
+    bat = glob.glob("/sys/class/power_supply/BAT*/capacity")
+    rep["battery"] = (open(bat[0]).read().strip() + "%") if bat else "?"
+    return rep
+
+
+def fmt(rep): return "\n".join(f"{k}: {v}" for k, v in rep.items())
+
+
+# ----------------------------------------------------------------- away-from-home alert
+def current_network():
+    """(router MAC, label) for the network the default route uses; (None, why) when offline/unknown."""
+    try: routes = [r for r in json.loads(run(["ip", "-j", "route", "show", "default"]).stdout or "[]") if r.get("gateway")]
+    except ValueError: routes = []
+    if not routes: return None, "offline"
+    r = min(routes, key=lambda r: r.get("metric", 0))
+    gw, dev = r["gateway"], r["dev"]
+    mac = ""
+    for attempt in range(2):
+        try: neigh = json.loads(run(["ip", "-j", "neigh", "show", gw, "dev", dev]).stdout or "[]")
+        except ValueError: neigh = []
+        mac = next((n["lladdr"].lower() for n in neigh if n.get("lladdr")), "")
+        if mac or attempt: break
+        run(["ping", "-c", "1", "-W", "2", "-I", dev, gw])      # make the kernel learn the router's MAC
+    if not mac: return None, f"router {gw} not answering"
+    name = run(["nmcli", "-t", "-g", "GENERAL.CONNECTION", "device", "show", dev]).stdout.strip()
+    return mac, f"{name or dev} via {dev}, router {gw} [{mac}]"
+
+
+def trusted_networks(path=TRUSTED_F):
+    try: return {l.split()[0].lower() for l in open(path) if l.strip() and not l.startswith("#")}
+    except OSError: return set()
+
+
+def away_decision(fp, trusted, st, now):
+    """Pure bookkeeping on st; returns why to alert (str) or None. fp = router MAC of the current network."""
+    gap = now - st.get("last_online", now)
+    st["last_online"] = now
+    if fp in trusted:
+        st.pop("away", None); return None
+    a = st.get("away")
+    if not a or a.get("fp") != fp:
+        st["away"] = {"fp": fp, "since": now, "last_alert": now}; return "it joined a network that isn't home"
+    if gap > OFFLINE_GAP:
+        a["last_alert"] = now; return f"it came back online after {int(gap // 60)} min offline, still away from home"
+    if now - a["last_alert"] > AWAY_REMIND:
+        a["last_alert"] = now; return f"reminder: still away from home ({int((now - a['since']) // 3600)} h so far)"
+    return None
+
+
+def pause_until():
+    try: return int(open(PAUSE_F).read().strip())
+    except (OSError, ValueError): return 0
+
+
+def away_email(why, label, st, armed):
+    rep, enc = locate(), bool(luks_devices())
+    since = time.strftime("%a %b %d %H:%M", time.localtime(st["away"]["since"]))
+    up = int(float(open("/proc/uptime").read().split()[0]) // 60)
+    wipe = "destroys the disk encryption keys: all data gone for good" if enc else \
+           "disk NOT encrypted yet: does the same as scrub + powers off"
+    steps = (f"""  ~/bin/deadman-order lost     location email every 10 min (until: deadman-order found)
+  ~/bin/deadman-order lock     lock the screen, kick the desktop user, block password logins
+  ~/bin/deadman-order scrub    delete saved passwords, keys, browser + cloud logins
+  ~/bin/deadman-order wipe     {wipe}
+The laptop picks orders up every 2 minutes, but ONLY while it stays online, so act soon.
+Each order replies with its own email.""" if armed else
+             "  !! Remote orders are NOT armed yet (no phone key trusted), so lock/wipe can't be sent.")
+    body = f"""Your laptop is online somewhere that is NOT home: {why}.
+
+Network:   {label}
+On it since {since} · laptop up {up // 60} h {up % 60} min · signed in: {rep.pop('logged_in')}
+
+WHERE IT IS
+{fmt(rep)}
+
+IF THIS WAS YOU: ignore this email. Travelling? On the laptop: deadman away pause 3d
+
+IF IT WASN'T YOU, in the phone's Terminal app, in this order:
+{steps}
+
+Next reminder in 4 h if it stays on this network."""
+    log(f"AWAY alert: {why} — {label}", "warning")
+    email("LAPTOP ONLINE AWAY FROM HOME", body)
+
+
+def away_check(st, armed):
+    """Returns a one-line status for status.json."""
+    trusted = trusted_networks()
+    fp, label = current_network()
+    if not trusted: return "no home network trusted yet (deadman trust-here)"
+    if fp is None: return label
+    why = away_decision(fp, trusted, st, time.time())
+    paused = pause_until()
+    if fp in trusted: return "home"
+    if paused > time.time(): return "away, alerts paused until " + time.strftime("%a %H:%M", time.localtime(paused))
+    if st.get("lost"): return "away (lost mode is reporting)"
+    if why: away_email(why, label, st, armed)
+    return "AWAY since " + time.strftime("%a %H:%M", time.localtime(st["away"]["since"]))
+
+
+# ----------------------------------------------------------------- actions
+def home(): return pwd.getpwnam(USER).pw_dir
+
+
+def act_lock():
+    run(["loginctl", "lock-sessions"])
+    run(["passwd", "-l", USER])                 # blocks password logins (screen unlock, GDM); the phone's SSH key still works
+    for s in run(["loginctl", "list-sessions", "--no-legend"]).stdout.splitlines():
+        sid, tty = s.split()[0], s.split()[-1] if s.split() else ""
+        if "pts" not in s: run(["loginctl", "terminate-session", sid])   # end desktop sessions, keep SSH (that's Levi)
+    return "screen locked, desktop sessions ended, password logins disabled (send 'unlock' to undo)"
+
+
+def act_unlock():
+    run(["passwd", "-u", USER]); return "password logins re-enabled"
+
+
+SCRUB = [".config/backup/restic-password", ".config/rclone", ".config/gh", ".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa",
+         ".config/google-chrome", ".mozilla", ".claude/.credentials.json", ".local/share/keyrings", ".config/watcher/healthchecks-url",
+         ".dotfiles/config", "Documents/keys"]
+
+
+def act_scrub():
+    h, gone = home(), []
+    for rel in SCRUB:
+        p = os.path.join(h, rel)
+        if os.path.lexists(p):
+            run(["rm", "-rf", "--one-file-system", p]); gone.append(rel)
+    run(["tailscale", "logout"])  # (orders still arrive: they're pulled over the internet, not Tailscale)
+    return "removed: " + (", ".join(gone) or "nothing found") + "; Tailscale logged out. Also revoke: Google sessions, GitHub token, Tailscale device."
+
+
+def luks_devices():
+    out = run(["lsblk", "-rno", "NAME,TYPE,FSTYPE,PATH"]).stdout
+    return [l.split()[3] for l in out.splitlines() if len(l.split()) >= 4 and l.split()[2] == "crypto_LUKS"]
+
+
+def act_wipe():
+    devs = luks_devices()
+    if not devs:
+        msg = act_scrub()
+        email("WIPE: disk is NOT encrypted", "Full wipe impossible without disk encryption. Did the next best thing: " + msg + " — powering off now.")
+        run(["systemctl", "poweroff", "-i"])
+        return "no LUKS: scrubbed + powered off"
+    email("WIPE executing", f"Destroying the encryption keys of {', '.join(devs)} now. The data becomes unrecoverable. Powering off after.")
+    for d in devs:
+        run(["cryptsetup", "erase", "--batch-mode", d], timeout=60)     # destroys every keyslot: crypto-erase
+    run(["systemctl", "poweroff", "-ff"])
+    return "crypto-erased " + ", ".join(devs)
+
+
+# ----------------------------------------------------------------- main loop
+def load_state():
+    try: return json.load(open(STATE_F))
+    except (OSError, ValueError): return {"since": "10m", "nonces": [], "lost": False, "last_lost_report": 0}
+
+
+def save_state(st):
+    st["nonces"] = st["nonces"][-500:]
+    tmp = STATE_F + ".tmp"; json.dump(st, open(tmp, "w")); os.chmod(tmp, 0o600); os.replace(tmp, STATE_F)
+
+
+def write_status(st, armed, note="", away=""):
+    os.makedirs(VAR, exist_ok=True)
+    json.dump({"last_poll": int(time.time()), "armed": armed, "lost_mode": st.get("lost", False),
+               "encrypted": bool(luks_devices()), "note": note, "away": away}, open(STATUS_F, "w"))
+    os.chmod(STATUS_F, 0o644)
+
+
+def poll():
+    if os.geteuid() != 0: sys.exit("deadman-agent must run as root")
+    st = load_state()
+    armed = os.path.exists(SIGNERS) and os.path.getsize(SIGNERS) > 0
+    topic = open(TOPIC_F).read().strip() if os.path.exists(TOPIC_F) else ""
+    try: away = away_check(st, armed and bool(topic))      # runs even before arming: knowing where it is matters most
+    except Exception as e: away = f"away check failed: {type(e).__name__}"
+    save_state(st)
+    if not armed or not topic:
+        write_status(st, armed, "not armed: no phone signing key yet (deadman arm)", away); return
+    url = f"https://ntfy.sh/{topic}/json?poll=1&since={st['since']}"
+    try:
+        msgs = [json.loads(l) for l in urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "deadman-agent"}), timeout=30)
+                .read().decode().splitlines() if l.strip()]
+    except Exception as e:
+        write_status(st, armed, f"poll failed: {type(e).__name__}", away); return
+    for m in msgs:
+        if m.get("event") != "message": continue
+        st["since"] = m["id"]
+        try:
+            body = json.loads(m.get("message", ""))
+            ok, why, f = verify(body["order"], body["sig"], SIGNERS, set(st["nonces"]))
+        except (ValueError, KeyError, TypeError):
+            ok, why, f = False, "malformed message", {}
+        if not ok:
+            log(f"REJECTED order ({why}): action={f.get('action')!r}", "warning")
+            email("order REJECTED", f"An order was rejected: {why}. If you didn't send it, someone knows your deadman channel.")
+            continue
+        st["nonces"].append(f["nonce"]); save_state(st)
+        a = f["action"]; log(f"ACCEPTED signed order: {a}", "warning")
+        if a == "test": email("test OK", "Signed order verified on " + HOST + ". Nothing was changed.")
+        elif a == "locate": email("location", fmt(locate()))
+        elif a == "lost": st["lost"] = True; email("LOST MODE on", "Location every 10 minutes until 'found'.\n\n" + fmt(locate()))
+        elif a == "found": st["lost"] = False; email("lost mode off", "Location reports stopped.")
+        elif a == "lock": email("locked", act_lock())
+        elif a == "unlock": email("unlocked", act_unlock())
+        elif a == "scrub": email("SCRUBBED", act_scrub())
+        elif a == "wipe": save_state(st); act_wipe()
+    if st.get("lost") and time.time() - st.get("last_lost_report", 0) > 600:
+        st["last_lost_report"] = time.time(); email("lost mode: location", fmt(locate()))
+    save_state(st); write_status(st, armed, away=away)
+
+
+def selftest():
+    """Sign orders with a throwaway key and check every acceptance/rejection rule. Changes nothing."""
+    with tempfile.TemporaryDirectory() as d:
+        key = f"{d}/k"; other = f"{d}/other"
+        for k in (key, other): run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", k])
+        signers = f"{d}/signers"
+        open(signers, "w").write(f'{PRINCIPAL} namespaces="{NAMESPACE}" {open(key + ".pub").read().strip()}\n')
+
+        def order(action="test", machine=MACHINE, issued=None, nonce=None, confirm="", k=key, ns=NAMESPACE):
+            t = (f"deadman-order v1\nmachine: {machine}\naction: {action}\nissued: {int(issued or time.time())}\n"
+                 f"nonce: {nonce or secrets.token_hex(16)}\n" + (f"confirm: {confirm}\n" if confirm else ""))
+            p = f"{d}/o-{secrets.token_hex(4)}"; open(p, "w").write(t)     # fresh file: ssh-keygen won't overwrite a .sig
+            run(["ssh-keygen", "-Y", "sign", "-f", k, "-n", ns, p])
+            return t, open(p + ".sig").read()
+
+        used = "ab" * 16
+        cases = [
+            ("valid test order", order(), True),
+            ("signed by another key", order(k=other), False),
+            ("other namespace", order(ns="something-else"), False),
+            ("other machine", order(machine="0" * 32), False),
+            ("stale (20 min old)", order(issued=time.time() - 1200), False),
+            ("replayed nonce", order(nonce=used), False),
+            ("unknown action", order(action="format-c"), False),
+            ("wipe without confirmation", order(action="wipe"), False),
+            ("wipe with wrong confirmation", order(action="wipe", confirm="WIPE 00000000"), False),
+            ("wipe with correct confirmation", order(action="wipe", confirm=f"WIPE {MACHINE[:8]}"), True),
+        ]
+        o, s = order(); cases.append(("tampered after signing", (o.replace("action: test", "action: wipe"), s), False))
+        bad = 0
+        for name, (o, s), want in cases:
+            got, why, _ = verify(o, s, signers, {used})
+            if got != want: bad += 1; print(f"✘ {name}: expected {want}, got {got} ({why})")
+        print(f"{len(cases) - bad}/{len(cases)} order checks correct")
+
+        # away-alert decisions (pure; fake clock)
+        home, cafe, other, H = "aa:aa:aa:aa:aa:aa", "bb:bb:bb:bb:bb:bb", "cc:cc:cc:cc:cc:cc", 3600
+        tf = f"{d}/trusted"; open(tf, "w").write(f"# comment\n{home.upper()}  home router\n")
+        tr, st, t, abad = trusted_networks(tf), {}, 1_000_000, 0
+        # (what happens, network, offline seconds before, minutes online with a check every 2 min, alerts expected)
+        steps = [("a day at home", home, 0, 24 * 60, 0),
+                 ("joins a cafe, stays 3 h", cafe, 0, 180, 1),
+                 ("stays 2 h more (4 h reminder)", cafe, 0, 120, 1),
+                 ("moves to another network", other, 0, 10, 1),
+                 ("asleep 1 h, wakes on same network", other, H, 10, 1),
+                 ("asleep 10 min, wakes on same network", other, 600, 10, 0),
+                 ("back home", home, 0, 60, 0),
+                 ("home overnight offline, wakes at home", home, 10 * H, 10, 0),
+                 ("cafe again", cafe, 0, 10, 1)]
+        for name, fp, off, mins, want in steps:
+            t += off; got = 0
+            for _ in range(max(1, mins // 2)):
+                t += 120; got += away_decision(fp, tr, st, t) is not None
+            if got != want: abad += 1; print(f"✘ away: {name}: expected {want} alert(s), got {got}")
+        print(f"{len(steps) - abad}/{len(steps)} away-alert checks correct")
+        return 0 if bad == 0 and abad == 0 else 1
+
+
+if __name__ == "__main__":
+    if "--selftest" in sys.argv: sys.exit(selftest())
+    if "--locate" in sys.argv: print(fmt(locate())); sys.exit(0)
+    poll()
