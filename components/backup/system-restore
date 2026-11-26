@@ -156,6 +156,7 @@ ph_deadman() {
     bash "$HOME/.config/deadman/install.sh" </dev/null 2>&1 | tee -a "$LOG" | tail -3 || note "deadman install reported a problem (see $LOG)"
     if [ $REHEARSAL = 1 ]; then note "rehearsal: deadman agent installed, NOT paired (never pair a VM with the phone)"; return 0; fi
     note "deadman: RE-PAIR THE PHONE. In a real terminal: deadman phone-setup → on the phone replace ~/.config/deadman/phone.conf (and re-copy ~/bin/deadman-order) → deadman arm '<line from: cat ~/.ssh/deadman_ed25519.pub on the phone>' → on the phone: ~/bin/deadman-order test → deadman log shows ACCEPTED"
+    note "remote: phone access is OFF until you run (real terminal, needs a Tailscale browser login): ~/.config/remote/install.sh — it applies the SSH hardening + Tailscale-only firewall zone, then enables sshd. Re-pair deadman AFTER this (phone-setup copies files over ssh)"
     note "deadman: at home, trust the router again: deadman trust-here. The disk is encrypted now, so 'wipe' is a real crypto-erase: update the deadman section of ~/Projects/fedora-workstation-automation/README.md"
     true
 }
@@ -197,6 +198,8 @@ ph_services() {
     awk '$2=="enabled"{print $1}' "$SB/system-services-enabled.txt" 2>/dev/null | while read -r u; do
         systemctl cat "$u" >/dev/null 2>&1 || continue
         [ "$(systemctl is-enabled "$u" 2>/dev/null)" = enabled ] && continue
+        # SSH only comes back through remote/install.sh (hardening drop-in + Tailscale-only firewall zone + Tailscale login)
+        [[ "$u" =~ ^(sshd|tailscaled)\.service$ ]] && continue
         [ $REHEARSAL = 1 ] && [[ "$u" =~ ^(nvidia|thinkfan|fwupd|bluetooth|ModemManager) ]] && continue
         sudo systemctl enable "$u" >/dev/null 2>&1 && echo "  enabled $u"
     done

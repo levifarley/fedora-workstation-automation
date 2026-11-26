@@ -396,6 +396,8 @@ def no_root_equivalent_access():
 @test("security")
 def remote_access_private():
     if run(["systemctl", "is-active", "sshd"]).stdout.strip() != "active": raise Skip("SSH off — no remote access")
+    if not shutil.which("tailscale"):
+        raise AssertionError("SSH is on but Tailscale isn't installed — run ~/.config/remote/install.sh (or turn SSH off)")
     r = run(["tailscale", "status", "--json"], timeout=20)
     if r.returncode != 0: raise AssertionError("SSH is on but Tailscale isn't connected — phone access won't work")
     j = json.loads(r.stdout)

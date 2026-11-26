@@ -45,6 +45,9 @@ Expect these manual follow-ups (the script lists them in its notes):
 - GNOME settings: `dconf load / < ~/.local/share/system-manifest/dconf-full.ini` from inside the desktop, then log out/in.
 - Go through `~/restore-etc-review.txt` (Wi-Fi, custom /etc changes) with Levi.
 - NVIDIA: `sudo dnf install akmod-nvidia xorg-x11-drv-nvidia-cuda` (from RPM Fusion), wait for the module to build, then reboot.
+- **Phone access (SSH over Tailscale) stays OFF** until `~/.config/remote/install.sh` is run in a real terminal (Tailscale
+  browser login). It applies the SSH hardening and the Tailscale-only firewall zone, then enables sshd. `system-restore`
+  deliberately doesn't re-enable sshd itself. Do this **before** re-pairing deadman.
 - **deadman must be re-paired with the phone** (phase `deadman` installs the agent and prints the steps): a fresh install
   has a new machine-id and a new order channel, so orders from the old `phone.conf` are rejected. `deadman phone-setup` →
   new `phone.conf` on the phone → `deadman arm '<phone's deadman_ed25519.pub>'` → `deadman-order test` → ACCEPTED in
