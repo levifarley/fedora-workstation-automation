@@ -38,6 +38,9 @@ SECRETS = [
     r"\.ssh/id_", r"\.ssh/.*key", r"\.gnupg/private", r"keyrings/", r"\.dotfiles",
     r"google-chrome/[^ ]*(Login Data|Cookies|Web Data)", r"\.mozilla/.*(logins\.json|key4\.db|cookies)",
     r"\.claude/\.credentials", r"\.config/gh/hosts\.yml",
+    # user-owned copies of root secrets: the nightly /etc + Tailscale archives and a restore's unpacked old /etc
+    r"system-backup/(etc|tailscale)\.tar", r"restore-staging/(etc-archive|var/lib/system-backup)", r"/var/lib/tailscale",
+    r"/etc/backup/", r"/var/cache/restic",          # the root-only backup credentials + repo cache (since 2026-11-27)
 ]
 ALLOWED_POST_HOSTS = ("ntfy.sh", "hc-ping.com")
 SENSITIVE_SITES = r"(mail\.google|accounts\.google|myaccount\.google|github\.com/settings|claude\.ai/settings|bank|paypal|venmo|" \

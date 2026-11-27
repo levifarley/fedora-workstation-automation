@@ -35,10 +35,26 @@ def ok(cond, fail_msg, ok_msg=""):
     if not cond: raise AssertionError(fail_msg)
     return ok_msg
 
-def backup_env():
-    """Load ~/.config/backup/env exactly as the backup does (bash source)."""
-    out = subprocess.run(["bash", "-c", f"source {HOME}/.config/backup/env && env -0"], capture_output=True, text=True).stdout
-    return dict(kv.split("=", 1) for kv in out.split("\0") if "=" in kv)
+VERIFY = f"{HOME}/.local/state/backup/verify.json"
+
+def verify_result(part, name, max_age_h, refresh=False):
+    """Read one check from the root backup job's verify.json (the repo itself is root-only since 2026-11-27).
+    refresh=True (full tests): if the full verification is stale, run it now (polkit lets levi start it) and wait."""
+    def load():
+        try: return json.load(open(VERIFY)).get(part) or {}
+        except (OSError, ValueError): return {}
+    v = load()
+    if refresh and time.time() - v.get("time", 0) > max_age_h * 3600:
+        run(["systemctl", "start", "backup-verify.service"], timeout=7200); v = load()
+    if not v: raise AssertionError(f"no {part} backup verification yet — run: backup verify" if part == "full" else
+                                   "the backup hasn't written verification results yet (run: backup)")
+    age = (time.time() - v["time"]) / 3600
+    if age > max_age_h: raise AssertionError(f"backup verification ({part}) is {age:.0f}h old — run: backup verify")
+    c = v.get("checks", {}).get(name)
+    if c is None: raise Skip(f"{name} not part of the {part} verification")
+    if c["ok"] is None: raise Skip(c["msg"])
+    if not c["ok"]: raise AssertionError(c["msg"])
+    return c["msg"]
 
 def have(cmd): return shutil.which(cmd) is not None
 
@@ -129,67 +145,38 @@ def watched_scripts_installed_match_source():
 
 # ------------------------------------------------------------------ backup
 @test("backup")
-def password_file_private():
-    p = f"{HOME}/.config/backup/restic-password"
-    return ok(os.path.exists(p) and (os.stat(p).st_mode & 0o077) == 0, "restic password file missing or readable by others", "present, mode 600")
+def credentials_root_only():
+    c = "/etc/backup"
+    if not os.path.isdir(c): raise AssertionError("/etc/backup missing — run ~/.config/backup/install.sh")
+    st = os.stat(c)
+    if st.st_uid != 0 or st.st_mode & 0o077: raise AssertionError("/etc/backup must be root-owned, mode 700")
+    if os.access(f"{c}/env", os.R_OK): raise AssertionError("the backup settings in /etc/backup are readable by levi")
+    left = [p.replace(HOME, "~") for p in (f"{HOME}/.config/backup/restic-password", f"{HOME}/.config/rclone/rclone.conf") if os.path.exists(p)]
+    if left: raise AssertionError(f"a user-readable copy of a backup credential is still in your home: {left} — re-run ~/.config/backup/install.sh")
+    u = run(["systemctl", "show", "system-backup.service", "-p", "User", "--value"]).stdout.strip()
+    if u not in ("", "root"): raise AssertionError(f"system-backup.service runs as '{u}', not root — re-run ~/.config/backup/install.sh")
+    return "root-only (/etc/backup 700), no copies in ~, the backup job runs as root"
 
 @test("backup")
-def drive_reachable():
-    r = run(["rclone", "lsf", "--max-depth", "1", "gdrive:fedora-backup"], timeout=60, env=backup_env())
-    return ok(r.returncode == 0 and "restic/" in r.stdout, f"can't list gdrive:fedora-backup: {r.stderr.strip()[-150:]}", "Drive reachable")
+def drive_reachable(): return verify_result("quick", "drive_reachable", 36)
 
 @test("backup")
-def latest_snapshot_fresh():
-    r = run(["restic", "snapshots", "latest", "--json", "--no-lock"], timeout=120, env=backup_env())
-    if r.returncode: raise AssertionError(f"restic can't open repo: {r.stderr.strip()[-150:]}")
-    s = json.loads(r.stdout)[0]
-    t = time.mktime(time.strptime(s["time"][:19], "%Y-%m-%dT%H:%M:%S"))
-    age = (time.time() - t) / 3600
-    return ok(age < 36, f"latest snapshot {s['short_id']} is {age:.0f}h old", f"{s['short_id']}, {age:.0f}h old")
+def latest_snapshot_fresh(): return verify_result("quick", "latest_snapshot_fresh", 36)
 
 @test("backup")
 def restore_guide_on_drive_current():
-    p = f"{HOME}/.config/backup/RESTORE.md"
-    r = run(["rclone", "cat", "gdrive:fedora-backup/RESTORE.md"], timeout=60, env=backup_env())
-    if r.returncode == 0 and r.stdout == open(p).read(): return "matches"
-    last_ok = f"{HOME}/.local/state/backup/last-success"
-    if os.path.exists(last_ok) and os.path.getmtime(p) > float(open(last_ok).read().strip() or 0):
-        raise Skip("edited since the last backup; the next backup uploads it")
-    raise AssertionError("RESTORE.md on Drive differs from local even though a backup ran since it changed")
+    try: return verify_result("quick", "restore_guide_current", 36)
+    except AssertionError:
+        last_ok = f"{HOME}/.local/state/backup/last-success"
+        if os.path.exists(last_ok) and os.path.getmtime(f"{HOME}/.config/backup/RESTORE.md") > float(open(last_ok).read().strip() or 0):
+            raise Skip("edited since the last backup; the next backup uploads it")
+        raise
 
 @test("backup", full=True)
-def restore_random_files():
-    env = backup_env()
-    r = run(["restic", "snapshots", "latest", "--json", "--no-lock"], timeout=120, env=env)
-    snap = json.loads(r.stdout)[0]
-    stime = time.mktime(time.strptime(snap["time"][:19], "%Y-%m-%dT%H:%M:%S"))
-    ls = run(["restic", "ls", "latest", "--json", "--recursive", "--no-lock", HOME], timeout=600, env=env)
-    cands = []
-    for l in ls.stdout.splitlines():
-        try: n = json.loads(l)
-        except ValueError: continue
-        if n.get("type") != "file" or not (1024 <= n.get("size", 0) <= 20 * 2**20): continue
-        p = n["path"]
-        try: st = os.stat(p)
-        except OSError: continue
-        if st.st_size == n["size"] and st.st_mtime < stime - 3600: cands.append(p)
-    if len(cands) < 5: raise Skip("not enough unchanged files to sample")
-    pick = random.sample(cands, 5)
-    with tempfile.TemporaryDirectory(dir=f"{HOME}/.cache") as tmp:
-        args = ["restic", "restore", "latest", "--no-lock", "--target", tmp] + sum([["--include", p] for p in pick], [])
-        rr = run(args, timeout=900, env=env)
-        if rr.returncode: raise AssertionError(f"restore failed: {rr.stderr.strip()[-200:]}")
-        h = lambda f: hashlib.sha256(open(f, "rb").read()).hexdigest()
-        bad = [p for p in pick if not os.path.exists(tmp + p) or h(tmp + p) != h(p)]
-    names = ", ".join(os.path.basename(p) for p in pick)
-    return ok(not bad, f"restored copies differ: {bad}", f"5/5 identical ({names[:80]})")
+def restore_random_files(): return verify_result("full", "restore_random_files", 8 * 24, refresh=True)
 
 @test("backup", full=True)
-def drive_quota():
-    r = run(["rclone", "about", "gdrive:", "--json"], timeout=60, env=backup_env())
-    j = json.loads(r.stdout); used, total = j.get("used", 0), j.get("total", 0)
-    if not total: raise Skip("quota unknown")
-    return ok(used / total < 0.8, f"Drive {used/total:.0%} full", f"{used/2**30:.0f} GiB of {total/2**40:.1f} TiB")
+def drive_quota(): return verify_result("full", "drive_quota", 8 * 24, refresh=True)
 
 # ------------------------------------------------------------------ snapshots
 def snapper_home():
@@ -245,9 +232,6 @@ def home_snapshot_roundtrip():
 # ------------------------------------------------------------------ movies (Samsung SSD → Drive)
 SSD = f"/run/media/{os.environ.get('USER', 'levi')}/Samsung SSD"
 
-def movies_env():
-    e = backup_env(); e["RESTIC_REPOSITORY"] = f"rclone:{e['RCLONE_REMOTE_DIR']}/movies"; return e
-
 @test("movies")
 def movies_backup_fresh():
     f = f"{HOME}/.local/state/movies-backup/last-success"
@@ -257,25 +241,8 @@ def movies_backup_fresh():
 
 @test("movies", full=True)
 def movies_restore_sample():
-    if not os.path.isdir(SSD) or not os.path.ismount(SSD): raise Skip("Samsung SSD not plugged in")
     if not os.path.exists(f"{HOME}/.local/state/movies-backup/last-success"): raise Skip("no movie backup yet")
-    env = movies_env()
-    snap = json.loads(run(["restic", "snapshots", "latest", "--json", "--no-lock"], timeout=120, env=env).stdout)[0]
-    stime = time.mktime(time.strptime(snap["time"][:19], "%Y-%m-%dT%H:%M:%S"))
-    files = []
-    for root, _, fs in os.walk(SSD):
-        for n in fs:
-            p = os.path.join(root, n)
-            try: st = os.stat(p)
-            except OSError: continue
-            if st.st_size > 64 * 2**20 and st.st_mtime < stime - 3600: files.append(p)
-    if not files: raise Skip("no unchanged movie files to sample")
-    p = random.choice(files); n = 32 * 2**20
-    d = subprocess.run(["restic", "dump", "--no-lock", "latest", p], capture_output=True, env=dict(os.environ, **env), timeout=900)
-    remote = hashlib.sha256(d.stdout[:n]).hexdigest() if d.returncode in (0, -13, 141) or len(d.stdout) >= n else None
-    with open(p, "rb") as fh: local = hashlib.sha256(fh.read(n)).hexdigest()
-    return ok(remote == local, f"restored data for {os.path.basename(p)} differs (or dump failed: {d.stderr[-120:]!r})",
-              f"first 32 MiB of {os.path.basename(p)[:50]} identical")
+    return verify_result("full", "movies_restore_sample", 8 * 24, refresh=True)
 
 # ------------------------------------------------------------------ security
 BASE = f"{HOME}/.config/watcher/baseline"
@@ -373,7 +340,7 @@ def deadman_away_alerts():
     s = json.load(open(status))
     if "away" not in s: raise Skip("agent without away alerts installed (~/.config/deadman/install.sh)")
     a = s["away"] or ""
-    if a.startswith("no home network"): raise AssertionError("away alerts can't work: no home router trusted — at home run: deadman trust-here")
+    if a.startswith("no home network"): raise AssertionError("away alerts can't work: no home router trusted — with the laptop at home, from the phone: ~/bin/deadman-order trust")
     if a.startswith("away check failed"): raise AssertionError(f"deadman {a} (see: journalctl -u deadman-agent)")
     if a.startswith("AWAY"): return f"ON ALERT — laptop is {a.lower()} (email sent)"
     return f"watching networks — now: {a}"
@@ -402,7 +369,12 @@ def remote_access_private():
     if r.returncode != 0: raise AssertionError("SSH is on but Tailscale isn't connected — phone access won't work")
     j = json.loads(r.stdout)
     funnel = any(p.get("Funnel") for p in [j.get("Self", {})] if isinstance(p, dict))
-    return ok(not funnel, "Tailscale Funnel exposes this laptop to the public internet — turn it off", "Tailscale up, nothing public")
+    if funnel: raise AssertionError("Tailscale Funnel exposes this laptop to the public internet — turn it off")
+    name = (j.get("Self", {}).get("DNSName") or "").split(".")[0]
+    if name and name != "system":
+        raise AssertionError(f"Tailscale calls this laptop '{name}', not 'system' (an old device holds the name) — the phone's "
+                             "`ssh system` goes to the wrong machine. login.tailscale.com/admin/machines: remove the old one, rename this one")
+    return "Tailscale up as 'system', nothing public"
 
 @test("security")
 def no_login_attack_signs():
@@ -417,7 +389,16 @@ def secrets_private():
              f"{HOME}/.config/watcher/ntfy-topic", f"{HOME}/.config/watcher/healthchecks-url",
              f"{HOME}/.config/watcher/smtp-netrc"]
     bad = [p for p in paths if os.path.exists(p) and os.stat(p).st_mode & 0o077]
-    return ok(not bad, f"readable by other users: {bad} — chmod 600", "backup/Drive/alert secrets are mode 600")
+    if bad: raise AssertionError(f"readable by other users: {bad} — chmod 600")
+    # the nightly /etc + Tailscale archives (password hashes, host keys, node key) must stay private to levi
+    sb = "/var/lib/system-backup"
+    if os.path.isdir(sb) and os.stat(sb).st_mode & 0o077: raise AssertionError(f"{sb} is readable by other users — chmod 700")
+    # a finished restore's staging copy of the OLD /etc shouldn't linger (it's an unprotected copy of every system secret)
+    st = "/var/tmp/restore-staging"
+    if os.path.isdir(st) and time.time() - os.stat(st).st_mtime > 3 * 86400:
+        raise AssertionError(f"{st} (copy of the old /etc from a restore) is still here after 3+ days — once ~/restore-etc-review.txt "
+                             f"is done: sudo rm -rf {st}")
+    return "backup/Drive/alert secrets are mode 600, system archives private" + (", restore staging still present (delete when the /etc review is done)" if os.path.isdir(st) else "")
 
 @test("security")
 def dotfiles_no_secrets():

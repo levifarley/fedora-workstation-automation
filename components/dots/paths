@@ -23,10 +23,8 @@
 ~/.local/bin/burnit
 ~/.local/bin/mkdvdiso
 ~/.local/bin/movielist
-~/.local/bin/claude-usage-today
 ~/.claude/skills
 ~/.claude/projects/-home-levi/memory
-~/.claude/statusline-usage.sh
 ~/.config/claude-guard
 ~/.local/bin/rehearsal
 ~/.config/remote

@@ -1,0 +1,17 @@
+[Unit]
+X-Watcher-Name=backup-verify
+X-Watcher-State=/home/levi/.local/state/backup/verify-full-result
+X-Watcher-MaxAge=8d
+X-Watcher-Schedule=weekly Sun 12:00 (real restores from Drive)
+OnFailure=watcher-notify@%n.service
+Description=Weekly backup verification: real restores from Google Drive, compared with the live files (as root)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecCondition=/usr/local/bin/watcher-gate backup-verify
+Type=oneshot
+ExecStart=/usr/local/bin/system-backup verify full
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

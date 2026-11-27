@@ -1,33 +1,24 @@
 #!/bin/bash
-# /usr/local/bin/system-backup — nightly encrypted backup of this Fedora system to Google Drive.
-#   system-backup root-stage   (run as root by systemd ExecStartPre=+) snapshot /etc, /usr/local, rpm drift
-#   system-backup run          (run as the user) build manifest, restic backup, retention, upload RESTORE.md
+# /usr/local/bin/system-backup: every restic job on this laptop, run as ROOT with root-only credentials.
+#   system-backup root-stage            snapshot /etc, /usr/local, the Tailscale node, rpm drift   (ExecStartPre)
+#   system-backup run                   nightly: manifest (as levi) → restic backup of ~levi + stage → retention → quick verify
+#   system-backup movies                Samsung SSD → its own restic repo                         (movies-backup.service)
+#   system-backup verify [full]         checks → ~levi/.local/state/backup/verify.json; full = real restores (weekly)
+#   system-backup restic <args…>        any restic command on the main repo (you: sudo system-backup restic snapshots)
+#   system-backup movies-restic <args…> the same for the movie repo
+#   system-backup restore [--movies] <path> [snap]   restore into ~levi/restored/, owned by levi
+#   system-backup manifest              (runs as levi, called by `run`) package/app/settings lists for a rebuild
+# Security model (2026-11-27):
+#   * Credentials live ONLY in /etc/backup (root 700): restic-password, rclone.conf. Settings: /etc/backup/env,
+#     excludes: /etc/backup/excludes, both root-owned copies installed by ~/.config/backup/install.sh after review.
+#     Root never sources or executes a file levi can edit.
+#   * Everything root writes into levi's home (results, restores) is written AS levi (runuser), so a planted symlink
+#     can't redirect a root write. Everything root reads from levi's home (RESTORE.md) is read as levi.
 # Installed from ~/.config/backup/system/ by ~/.config/backup/install.sh. Edit there, re-run install.
 set -uo pipefail
-
-BACKUP_USER="${BACKUP_USER:-levi}"
-STAGE=/var/lib/system-backup
-
 log() { echo "[$(date '+%F %T')] $*"; }
 
-root_stage() {
-    umask 077
-    mkdir -p "$STAGE"
-    log "Archiving /etc and /usr/local"
-    tar --zstd --xattrs --selinux --acls -cpf "$STAGE/etc.tar.zst" -C / etc 2>"$STAGE/tar-errors.log"
-    tar --zstd --xattrs --selinux --acls -cpf "$STAGE/usr-local.tar.zst" -C / usr/local 2>>"$STAGE/tar-errors.log"
-    log "Listing package files changed from RPM defaults (rpm -Va)"
-    rpm -Va --nodeps --noscripts 2>/dev/null | grep -E '^..5' >"$STAGE/rpm-modified-files.txt" || true
-    cat /proc/cmdline >"$STAGE/kernel-cmdline.txt"
-    lsblk -f -o NAME,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS >"$STAGE/disks.txt" 2>&1
-    systemctl list-unit-files --state=enabled --no-pager >"$STAGE/system-services-enabled.txt"
-    command -v docker >/dev/null && docker image ls --format '{{.Repository}}:{{.Tag}}' >"$STAGE/docker-images.txt" 2>/dev/null
-    chown -R "$BACKUP_USER:$BACKUP_USER" "$STAGE"
-    chmod 700 "$STAGE"
-    log "Root stage done"
-}
-
-build_manifest() {
+build_manifest() {   # runs as levi: these are levi's settings and need levi's session
     local M="$HOME/.local/share/system-manifest"
     mkdir -p "$M"
     log "Building system manifest in $M"
@@ -38,7 +29,7 @@ build_manifest() {
         grep -E '^(NAME|VERSION|VERSION_ID)=' /etc/os-release
         echo "user: $(id)"
     } >"$M/system-info.txt"
-    dnf repoquery --userinstalled --queryformat '%{name}\n' 2>/dev/null | sort -u >"$M/dnf-userinstalled.txt"
+    dnf repoquery --userinstalled --queryformat '%{name}\n' 2>/dev/null | grep -v '^kmod-' | sort -u >"$M/dnf-userinstalled.txt"
     dnf repolist --enabled 2>/dev/null >"$M/dnf-repos-enabled.txt"
     dnf copr list 2>/dev/null >"$M/dnf-copr.txt"
     flatpak remotes --columns=name,url,options 2>/dev/null >"$M/flatpak-remotes.txt"
@@ -52,43 +43,67 @@ build_manifest() {
     pip list --user 2>/dev/null >"$M/pip-user.txt"
     crontab -l >"$M/crontab.txt" 2>/dev/null
     cp "$HOME/.config/backup/RESTORE.md" "$M/RESTORE.md"
+    true
+}
+if [ "${1:-}" = manifest ]; then build_manifest; exit 0; fi
+
+# ---------------------------------------------------------------- everything below runs as root
+[ "$(id -u)" = 0 ] || { echo "system-backup runs as root: sudo system-backup ${1:-…}  (or let its systemd unit run it)"; exit 1; }
+CONF=/etc/backup
+[ -O "$CONF" ] && [ -O "$CONF/env" ] && [ -r "$CONF/env" ] || { echo "missing or not root-owned: $CONF/env — run ~/.config/backup/install.sh"; exit 1; }
+# shellcheck source=/dev/null
+source "$CONF/env"
+U="${BACKUP_USER:?BACKUP_USER not set in $CONF/env}"; UH=$(getent passwd "$U" | cut -d: -f6); UID_=$(id -u "$U")
+STAGE=/var/lib/system-backup
+STATE="$UH/.local/state/backup"; MSTATE="$UH/.local/state/movies-backup"
+SSD="/run/media/$U/Samsung SSD"
+MAIN_REPO="$RESTIC_REPOSITORY"; MOVIES_REPO="rclone:${RCLONE_REMOTE_DIR}/movies"
+mkdir -p "$RESTIC_CACHE_DIR"; chmod 700 "$RESTIC_CACHE_DIR"
+
+as_user() { runuser -u "$U" -- "$@"; }
+put() {   # put <file in levi's home> <text>: written AS levi (a symlink planted there can't redirect a root write)
+    as_user mkdir -p "$(dirname "$1")" && printf '%s\n' "$2" | as_user tee "$1.tmp" >/dev/null && as_user mv -f "$1.tmp" "$1"
+}
+
+root_stage() {
+    umask 077
+    mkdir -p "$STAGE"; chown root:root "$STAGE"; chmod 700 "$STAGE"
+    log "Archiving /etc and /usr/local"
+    tar --zstd --xattrs --selinux --acls -cpf "$STAGE/etc.tar.zst" -C / etc 2>"$STAGE/tar-errors.log"
+    tar --zstd --xattrs --selinux --acls -cpf "$STAGE/usr-local.tar.zst" -C / usr/local 2>>"$STAGE/tar-errors.log"
+    # Tailscale node identity: restored by system-restore (phase identity) so a reinstall keeps the same tailnet name + IP
+    [ -d /var/lib/tailscale ] && tar --zstd --selinux -cpf "$STAGE/tailscale.tar.zst" -C / var/lib/tailscale 2>>"$STAGE/tar-errors.log"
+    log "Listing package files changed from RPM defaults (rpm -Va)"
+    rpm -Va --nodeps --noscripts 2>/dev/null | grep -E '^..5' >"$STAGE/rpm-modified-files.txt" || true
+    cat /proc/cmdline >"$STAGE/kernel-cmdline.txt"
+    lsblk -f -o NAME,FSTYPE,LABEL,UUID,SIZE,MOUNTPOINTS >"$STAGE/disks.txt" 2>&1
+    systemctl list-unit-files --state=enabled --no-pager >"$STAGE/system-services-enabled.txt"
+    as_user env XDG_RUNTIME_DIR="/run/user/$UID_" docker image ls --format '{{.Repository}}:{{.Tag}}' >"$STAGE/docker-images.txt" 2>/dev/null
+    # stays root-only: it holds password hashes, host keys, the Tailscale node key, Wi-Fi passwords
+    log "Root stage done"
 }
 
 run_backup() {
-    # shellcheck source=/dev/null
-    source "$HOME/.config/backup/env"
-    local state="$HOME/.local/state/backup"
-    mkdir -p "$state"
-
     log "Waiting for network"
-    nm-online -q -t 300 || { log "No network after 5 min"; echo "$(date -Is) FAILED (no network)" >"$state/last-result"; exit 1; }
+    nm-online -q -t 300 || { log "No network after 5 min"; put "$STATE/last-result" "$(date -Is) FAILED (no network)"; exit 1; }
 
-    build_manifest
+    as_user env HOME="$UH" XDG_RUNTIME_DIR="/run/user/$UID_" /usr/local/bin/system-backup manifest
 
-    log "Running restic backup -> $RESTIC_REPOSITORY"
-    local paths=("$HOME")
-    [ -d "$STAGE" ] && paths+=("$STAGE")
-    # Retry up to 3 times: Drive throws transient 500s; restic reuses data already uploaded
+    log "Running restic backup -> $MAIN_REPO"
     local attempt rc=1
-    for attempt in 1 2 3; do
+    for attempt in 1 2 3; do       # Drive throws transient 500s; restic reuses data already uploaded
         rc=0
-        restic -o rclone.connections=2 backup "${paths[@]}" \
-            --one-file-system \
-            --exclude-caches \
-            --exclude-file "$HOME/.config/backup/excludes" \
-            --tag nightly \
-            --host "$(hostname)" \
-            --verbose=1 || rc=$?
+        restic -o rclone.connections=2 backup "$UH" "$STAGE" \
+            --one-file-system --exclude-caches --exclude-file "$CONF/excludes" \
+            --tag nightly --host "$(hostname)" --verbose=1 || rc=$?
         [ $rc -eq 0 ] || [ $rc -eq 3 ] && break
         log "restic backup attempt $attempt failed (exit $rc); retrying in 2 min"
         restic unlock || true
         sleep 120
     done
-    # restic exit 3 = some files unreadable (still a valid snapshot)
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then     # exit 3 = some files unreadable (still a valid snapshot)
         log "restic backup failed (exit $rc)"
-        echo "$(date -Is) FAILED (restic exit $rc)" >"$state/last-result"
-        exit 1
+        put "$STATE/last-result" "$(date -Is) FAILED (restic exit $rc)"; exit 1
     fi
 
     log "Applying retention: 7 daily, 4 weekly, 12 monthly"
@@ -96,24 +111,210 @@ run_backup() {
     [ "$(date +%u)" = 7 ] && prune=(--prune --max-unused 10%)   # prune Sundays only
     restic -o rclone.connections=2 forget --host "$(hostname)" --keep-daily 7 --keep-weekly 4 --keep-monthly 12 "${prune[@]}" \
         || log "WARNING: restic forget/prune failed (snapshot itself is fine)"
-
     if [ "$(date +%d)" = 01 ]; then
         log "Monthly integrity check (5% of data)"
         restic check --read-data-subset=5% || log "WARNING: restic check reported problems"
     fi
 
-    # Plain-text restore guide next to the encrypted repo, readable without the password
-    rclone copyto "$HOME/.config/backup/RESTORE.md" "${RCLONE_REMOTE_DIR}/RESTORE.md"
+    # plain-text restore guide next to the encrypted repo (readable without the password); read AS levi
+    local guide; guide=$(mktemp); as_user cat "$UH/.config/backup/RESTORE.md" >"$guide" &&
+        rclone copyto "$guide" "${RCLONE_REMOTE_DIR}/RESTORE.md"; rm -f "$guide"
 
     local info
-    info=$(restic snapshots latest --json 2>/dev/null | jq -r '.[0] | "snapshot \(.short_id) · +\((.summary.data_added // 0) / 1048576 | floor) MiB new · \((.summary.total_files_processed // 0)) files"' 2>/dev/null)
-    echo "$(date -Is) OK${info:+ · $info}" >"$state/last-result"
-    date +%s >"$state/last-success"
+    info=$(restic snapshots latest --json --no-lock 2>/dev/null | jq -r '.[0] | "snapshot \(.short_id) · +\((.summary.data_added // 0) / 1048576 | floor) MiB new · \((.summary.total_files_processed // 0)) files"' 2>/dev/null)
+    put "$STATE/last-result" "$(date -Is) OK${info:+ · $info}"
+    put "$STATE/last-success" "$(date +%s)"
     log "Backup complete"
+    verify quick || true
+}
+
+run_movies() {
+    export RESTIC_REPOSITORY="$MOVIES_REPO"
+    if ! mountpoint -q "$SSD"; then log "Samsung SSD not plugged in — nothing to do"; return 0; fi
+    if ! nm-online -q -t 120; then
+        log "offline — skipping (the 8-day staleness check still watches for a real gap)"
+        put "$MSTATE/last-result" "$(date -Is) SKIPPED · offline"; return 0
+    fi
+    if ! restic cat config >/dev/null 2>&1; then
+        mountpoint -q "$SSD" || return 0
+        local top
+        if ! top=$(rclone lsf --max-depth 1 "$RCLONE_REMOTE_DIR" 2>/dev/null); then
+            log "Google Drive unreachable right now — will retry next run"
+            put "$MSTATE/last-result" "$(date -Is) SKIPPED · Drive unreachable"; return 0
+        elif ! grep -qx 'movies/' <<<"$top"; then
+            log "Creating movies repository"; restic init || return 1
+        else   # Drive works and the repo exists but won't open: wrong password or damage — a real problem
+            put "$MSTATE/last-result" "$(date -Is) FAILED · movies repository exists but can't be opened"; return 1
+        fi
+    fi
+    restic unlock >/dev/null 2>&1 || true
+    log "Backing up $SSD → $RESTIC_REPOSITORY"
+    local rc=1 attempt
+    for attempt in 1 2 3; do
+        rc=0
+        # exFAT has no stable inodes/ctime: compare by size + mtime only, so unchanged movies aren't re-read
+        restic -o rclone.connections=2 backup "$SSD" --ignore-inode --ignore-ctime \
+            --exclude '.Trash-*' --exclude 'System Volume Information' --exclude '.work' \
+            --tag movies --host "$(hostname)" --verbose=1 || rc=$?
+        [ $rc -eq 0 ] || [ $rc -eq 3 ] && break
+        mountpoint -q "$SSD" || break
+        log "attempt $attempt failed (exit $rc); retrying in 2 min"; restic unlock || true; sleep 120
+    done
+    if [ $rc -ne 0 ] && [ $rc -ne 3 ]; then
+        if ! mountpoint -q "$SSD"; then
+            log "SSD was unplugged mid-backup — interrupted, will resume next time"
+            put "$MSTATE/last-result" "$(date -Is) INTERRUPTED · SSD unplugged mid-backup; resumes on next plug-in"
+            restic unlock >/dev/null 2>&1 || true; return 0
+        fi
+        put "$MSTATE/last-result" "$(date -Is) FAILED · restic exit $rc"; return 1
+    fi
+    restic -o rclone.connections=2 forget --tag movies --keep-daily 7 --keep-weekly 4 --keep-monthly 6 \
+        $([ "$(date +%u)" = 7 ] && echo --prune --max-unused 10%) || log "WARNING: retention failed (backup itself is fine)"
+    local info
+    info=$(restic snapshots latest --json --no-lock | jq -r '.[0] | "snapshot \(.short_id) · +\((.summary.data_added // 0) / 1048576 | floor) MiB new · \(.summary.total_files_processed // 0) files · \((.summary.total_bytes_processed // 0) / 1073741824 | floor) GiB"')
+    put "$MSTATE/last-result" "$(date -Is) OK · $info"
+    put "$MSTATE/last-success" "$(date +%s)"
+    log "Done: $info"
+}
+
+verify() {   # verify quick|full → verify.json (+ verify-full-result for the watched weekly job)
+    local mode="${1:-quick}" out
+    log "Verifying backups ($mode)"
+    out=$(MODE="$mode" UH="$UH" SSD="$SSD" MAIN_REPO="$MAIN_REPO" MOVIES_REPO="$MOVIES_REPO" python3 -I - <<'PY'
+import hashlib, json, os, random, subprocess, tempfile, time
+mode, UH, SSD = os.environ["MODE"], os.environ["UH"], os.environ["SSD"]
+checks = {}
+def run(args, repo=None, timeout=600, **kw):
+    env = dict(os.environ, **({"RESTIC_REPOSITORY": repo} if repo else {}))
+    return subprocess.run(args, capture_output=True, text=kw.pop("text", True), timeout=timeout, env=env, **kw)
+def check(name, fn):
+    try: checks[name] = {"ok": True, "msg": fn()}
+    except SkipCheck as e: checks[name] = {"ok": None, "msg": str(e)}
+    except Exception as e: checks[name] = {"ok": False, "msg": f"{type(e).__name__}: {e}"[:300]}
+class SkipCheck(Exception): pass
+def snap_time(s): return time.mktime(time.strptime(s["time"][:19], "%Y-%m-%dT%H:%M:%S"))
+def latest(repo):
+    r = run(["restic", "snapshots", "latest", "--json", "--no-lock"], repo, 180)
+    if r.returncode: raise RuntimeError("restic can't open the repo: " + r.stderr.strip()[-150:])
+    return json.loads(r.stdout)[0]
+
+def drive():
+    r = run(["rclone", "lsf", "--max-depth", "1", os.environ["RCLONE_REMOTE_DIR"]], timeout=90)
+    if r.returncode or "restic/" not in r.stdout: raise RuntimeError("can't list the Drive folder: " + r.stderr.strip()[-150:])
+    return "Drive reachable"
+def fresh():
+    s = latest(os.environ["MAIN_REPO"]); age = (time.time() - snap_time(s)) / 3600
+    if age > 36: raise RuntimeError(f"latest snapshot {s['short_id']} is {age:.0f}h old")
+    return f"{s['short_id']}, {age:.0f}h old"
+def guide():
+    r = run(["rclone", "cat", os.environ["RCLONE_REMOTE_DIR"] + "/RESTORE.md"], timeout=90)
+    local = subprocess.run(["runuser", "-u", os.environ["BACKUP_USER"], "--", "cat", f"{UH}/.config/backup/RESTORE.md"],
+                           capture_output=True, text=True).stdout
+    if r.returncode == 0 and r.stdout == local: return "matches"
+    raise RuntimeError("RESTORE.md on Drive differs from the local one")
+def stats():
+    out = {}
+    for key, repo in (("backup_bytes", os.environ["MAIN_REPO"]), ("movies_bytes", os.environ["MOVIES_REPO"])):
+        r = run(["restic", "stats", "--mode", "raw-data", "--no-lock", "--json"], repo, 900)
+        try: out[key] = json.loads(r.stdout)["total_size"]
+        except (ValueError, KeyError): out[key] = None
+    r = run(["rclone", "about", "gdrive:", "--json"], timeout=120)
+    try: j = json.loads(r.stdout); out["drive_used"], out["drive_total"] = j.get("used"), j.get("total")
+    except ValueError: pass
+    checks["_stats"] = out
+    return "sizes recorded"
+def quota():
+    s = checks.get("_stats", {}); used, total = s.get("drive_used") or 0, s.get("drive_total") or 0
+    if not total: raise SkipCheck("quota unknown")
+    if used / total >= 0.8: raise RuntimeError(f"Drive {used/total:.0%} full")
+    return f"{used/2**30:.0f} GiB of {total/2**40:.1f} TiB"
+def restore_files():
+    repo = os.environ["MAIN_REPO"]; s = latest(repo); st0 = snap_time(s)
+    ls = run(["restic", "ls", "latest", "--json", "--recursive", "--no-lock", UH], repo, 900)
+    cands = []
+    for l in ls.stdout.splitlines():
+        try: n = json.loads(l)
+        except ValueError: continue
+        if n.get("type") != "file" or not (1024 <= n.get("size", 0) <= 20 * 2**20): continue
+        p = n["path"]
+        try: st = os.lstat(p)
+        except OSError: continue
+        if os.path.isfile(p) and not os.path.islink(p) and st.st_size == n["size"] and st.st_mtime < st0 - 3600: cands.append(p)
+    if len(cands) < 5: raise SkipCheck("not enough unchanged files to sample")
+    pick = random.sample(cands, 5)
+    with tempfile.TemporaryDirectory(dir="/var/tmp") as tmp:       # root-only temp, not in levi's home
+        rr = run(["restic", "restore", "latest", "--no-lock", "--target", tmp] + sum([["--include", p] for p in pick], []), repo, 900)
+        if rr.returncode: raise RuntimeError("restore failed: " + rr.stderr.strip()[-200:])
+        h = lambda f: hashlib.sha256(open(f, "rb").read()).hexdigest()
+        bad = [p for p in pick if not os.path.exists(tmp + p) or h(tmp + p) != h(p)]
+    if bad: raise RuntimeError(f"restored copies differ: {bad}")
+    return "5/5 restored files identical"
+def movies_sample():
+    if not os.path.ismount(SSD): raise SkipCheck("Samsung SSD not plugged in")
+    repo = os.environ["MOVIES_REPO"]; s = latest(repo); st0 = snap_time(s)
+    files = []
+    for root, _, fs in os.walk(SSD):
+        for n in fs:
+            p = os.path.join(root, n)
+            try: st = os.stat(p)
+            except OSError: continue
+            if st.st_size > 64 * 2**20 and st.st_mtime < st0 - 3600: files.append(p)
+    if not files: raise SkipCheck("no unchanged movie files to sample")
+    p = random.choice(files); n = 32 * 2**20
+    # read only the first n bytes of the restored stream, then stop the download (a movie is several GB)
+    d = subprocess.Popen(["restic", "dump", "--no-lock", "latest", p], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         env=dict(os.environ, RESTIC_REPOSITORY=repo))
+    try:
+        data = b""
+        while len(data) < n:
+            chunk = d.stdout.read(n - len(data))
+            if not chunk: break
+            data += chunk
+    finally:
+        d.kill(); d.wait()
+    remote = hashlib.sha256(data).hexdigest() if len(data) == n or os.path.getsize(p) == len(data) else None
+    with open(p, "rb") as fh: local = hashlib.sha256(fh.read(n)).hexdigest()
+    if remote != local: raise RuntimeError(f"restored data for {os.path.basename(p)} differs")
+    return f"first 32 MiB of {os.path.basename(p)[:50]} identical"
+
+check("drive_reachable", drive); check("latest_snapshot_fresh", fresh); check("restore_guide_current", guide)
+check("stats", stats)
+if mode == "full":
+    check("drive_quota", quota); check("restore_random_files", restore_files); check("movies_restore_sample", movies_sample)
+print(json.dumps({"time": int(time.time()), "mode": mode, "checks": checks}))
+PY
+)
+    [ -n "$out" ] || { log "verify produced no result"; return 1; }
+    # keep the last full run's results when only a quick run happened
+    local prev="{}"; [ -f "$STATE/verify.json" ] && prev=$(as_user cat "$STATE/verify.json" 2>/dev/null || echo '{}')
+    put "$STATE/verify.json" "$(jq -c --argjson prev "$prev" '{quick: (if .mode == "quick" then . else ($prev.quick // .) end),
+                                                                full:  (if .mode == "full"  then . else ($prev.full // null) end)}' <<<"$out" 2>/dev/null || echo "$out")"
+    local failed; failed=$(jq -r '[.checks | to_entries[] | select(.value.ok == false) | .key] | join(", ")' <<<"$out")
+    if [ "$mode" = full ]; then
+        put "$STATE/verify-full-result" "$(date -Is) $([ -z "$failed" ] && echo OK || echo "FAILED · $failed")"
+    fi
+    [ -z "$failed" ] && log "Verify OK" || { log "Verify FAILED: $failed"; return 1; }
+}
+
+restore_into_home() {   # restore [--movies] <path> [snap]
+    local repo="$MAIN_REPO" sub=restored
+    [ "${1:-}" = --movies ] && { repo="$MOVIES_REPO"; sub=restored/movies; shift; }
+    [ -n "${1:-}" ] || { echo "usage: system-backup restore [--movies] <path> [snapshot]"; return 2; }
+    local tmp; tmp=$(mktemp -d /var/tmp/backup-restore.XXXXXX)          # root-only; copied into ~ AS levi
+    RESTIC_REPOSITORY="$repo" restic restore "${2:-latest}" --include "$1" --target "$tmp" || { rm -rf "$tmp"; return 1; }
+    chown -R "$U:$U" "$tmp"; chmod 755 "$tmp"
+    as_user mkdir -p "$UH/$sub" && as_user cp -a "$tmp/." "$UH/$sub/"; local rc=$?
+    rm -rf "$tmp"
+    [ $rc = 0 ] && echo "Restored into ~/$sub$1"; return $rc
 }
 
 case "${1:-}" in
-    root-stage) root_stage ;;
-    run) run_backup ;;
-    *) echo "usage: $0 {root-stage|run}" >&2; exit 2 ;;
+    root-stage)    root_stage ;;
+    run)           run_backup ;;
+    movies)        run_movies ;;
+    verify)        verify "${2:-quick}" ;;
+    restic)        shift; RESTIC_REPOSITORY="$MAIN_REPO" restic "$@" ;;
+    movies-restic) shift; RESTIC_REPOSITORY="$MOVIES_REPO" restic "$@" ;;
+    restore)       shift; restore_into_home "$@" ;;
+    *) sed -n '2,10p' "$0" >&2; exit 2 ;;
 esac

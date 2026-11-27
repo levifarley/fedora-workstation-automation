@@ -4,7 +4,7 @@
 # Undo: sudo systemctl disable --now sshd; sudo tailscale down
 set -euo pipefail
 R="$HOME/.config/remote"
-B=$'\e[1m'; G=$'\e[32m'; N=$'\e[0m'
+B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; N=$'\e[0m'
 step() { echo; echo "${B}▶ $*${N}"; }
 
 step "Packages (Tailscale, mosh, tmux — all from Fedora's repos)"
@@ -41,6 +41,12 @@ sudo install -d -m 755 /var/lib/remote-access
 sudo sshd -T 2>/dev/null | sudo tee /var/lib/remote-access/sshd-effective >/dev/null
 
 echo
-echo "${G}${B}✔ Remote access ready.${N} This laptop on your tailnet: $(tailscale ip -4 2>/dev/null | head -1)  (name: system)"
+tsname=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | cut -d. -f1)
+echo "${G}${B}✔ Remote access ready.${N} This laptop on your tailnet: $(tailscale ip -4 2>/dev/null | head -1)  (name: ${tsname:-?})"
+if [ -n "$tsname" ] && [ "$tsname" != system ]; then
+    echo "${Y}! Tailscale named it '$tsname', not 'system' — an old device (e.g. from before a reinstall) still holds that name,"
+    echo "  so the phone's 'ssh system' goes to the old one. Fix: login.tailscale.com/admin/machines → remove the old 'system',"
+    echo "  then rename '$tsname' → 'system' (⋯ → Edit machine name, untick auto-generate).${N}"
+fi
 echo "On the phone (Terminal app): see  remote phone-setup"
 "$HOME/.local/bin/watcher" test baseline >/dev/null 2>&1 || true

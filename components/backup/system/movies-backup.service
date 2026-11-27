@@ -1,0 +1,23 @@
+[Unit]
+X-Watcher-Name=movies-backup
+X-Watcher-State=/home/levi/.local/state/movies-backup/last-result
+X-Watcher-SuccessFile=/home/levi/.local/state/movies-backup/last-success
+X-Watcher-MaxAge=8d
+X-Watcher-Rerun=no
+OnFailure=watcher-notify@%n.service
+Description=Back up the Samsung SSD movie collection to Google Drive (restic, as root)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# Runs as ROOT with the root-only credentials in /etc/backup (was a user unit until 2026-11-27)
+ExecCondition=/usr/local/bin/watcher-gate movies-backup
+Type=oneshot
+ExecStart=/usr/local/bin/system-backup movies
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=12h
+
+[Install]
+# start whenever the SSD gets mounted
+WantedBy=run-media-levi-Samsung\x20SSD.mount

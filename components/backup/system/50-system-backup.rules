@@ -1,7 +1,9 @@
-// Let levi start the backup service (`backup now`) without a password prompt.
+// Let levi START the root backup jobs (`backup`, `movies-backup`, the weekly verify in `watcher test --full`) without a
+// password. Starting runs fixed root-owned code; it can't read the credentials or change what the job does.
 polkit.addRule(function(action, subject) {
+    var units = ["system-backup.service", "movies-backup.service", "backup-verify.service"];
     if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        action.lookup("unit") == "system-backup.service" &&
+        units.indexOf(action.lookup("unit")) >= 0 &&
         action.lookup("verb") == "start" &&
         subject.user == "levi") {
         return polkit.Result.YES;

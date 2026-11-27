@@ -3,26 +3,34 @@
 # group: System care
 #   system-restore                 run every phase (each is skipped once done; safe to re-run after fixing a problem)
 #   system-restore --rehearsal     same, inside a throwaway VM: no NVIDIA/firmware, never writes to Drive/GitHub/phone
-#   system-restore --phase NAME    run one phase: tools stage repos packages home usrlocal flatpak installers deadman docker services dconf etc verify
+#   system-restore --phase NAME    run one phase: tools stage repos packages nvidia home usrlocal flatpak identity installers deadman docker services dconf etc verify
 #   system-restore --list          show phases and which are done
-# Needs before starting: ~/.config/rclone/rclone.conf (Drive login) and ~/.config/backup/restic-password (from Levi).
+#   system-restore --phase identity --dry-run   show what phase identity WOULD restore from the staged backup (changes nothing;
+#                                  works in a rehearsal too — the way to check a backup carries the laptop's identity)
+# Needs before starting (RESTORE.md → Bootstrap): the Drive login and the backup password in /etc/backup (root 700),
+# where the backups read them since 2026-11-27. restic runs through sudo; nothing here keeps a copy in ~.
 # Never overwrites /etc blindly: it writes a review report of every changed /etc file instead (phase "etc").
 set -uo pipefail
-REHEARSAL=0; ONLY=""
+REHEARSAL=0; ONLY=""; DRY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --rehearsal) REHEARSAL=1 ;;
+        --dry-run) DRY=1 ;;
         --phase) ONLY="$2"; shift ;;
         --list) LIST=1 ;;
         -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0"; exit 0 ;;
     esac; shift
 done
-PHASES=(tools stage repos packages home usrlocal flatpak installers deadman docker services dconf etc verify)
+PHASES=(tools stage repos packages nvidia home usrlocal flatpak identity installers deadman docker services dconf etc verify)
 STAGE=/var/tmp/restore-staging
 DONE="$HOME/.local/state/system-restore"; mkdir -p "$DONE"
 LOG="$HOME/system-restore.log"
-export RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf" RCLONE_DRIVE_USE_TRASH=false RCLONE_TPSLIMIT=8
-export RESTIC_REPOSITORY="rclone:gdrive:fedora-backup/restic" RESTIC_PASSWORD_FILE="$HOME/.config/backup/restic-password"
+CRED=/etc/backup
+# restic as root with the root-only credentials (same settings as the nightly job)
+restic() { sudo env RCLONE_CONFIG="$CRED/rclone.conf" RESTIC_PASSWORD_FILE="$CRED/restic-password" \
+               RESTIC_REPOSITORY="rclone:gdrive:fedora-backup/restic" RESTIC_CACHE_DIR=/var/cache/restic \
+               RCLONE_DRIVE_USE_TRASH=false RCLONE_TPSLIMIT=8 RCLONE_TPSLIMIT_BURST=8 RCLONE_LOW_LEVEL_RETRIES=20 \
+               restic "$@"; }
 B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
 say()  { echo "${B}[$(date +%H:%M:%S)] $*${N}" | tee -a "$LOG"; }
 note() { echo "${Y}  ! $*${N}" | tee -a "$LOG"; echo "$*" >>"$DONE/notes.txt"; }
@@ -38,14 +46,20 @@ fi
 ph_tools() {
     [ $REHEARSAL = 1 ] && sudo hostnamectl set-hostname fedora-rehearsal
     sudo dnf install -y restic rclone jq rsync zstd tar python3 || return 1
-    [ -s "$RCLONE_CONFIG" ] || { echo "Missing Drive login: create it with step 2 of RESTORE.md (rclone config create gdrive drive ...)"; return 1; }
-    [ -s "$RESTIC_PASSWORD_FILE" ] || { echo "Missing $RESTIC_PASSWORD_FILE — paste the restic password from your password manager (chmod 600)"; return 1; }
+    sudo test -s "$CRED/rclone.conf" || { echo "Missing Drive login $CRED/rclone.conf — RESTORE.md → Bootstrap step 3"; return 1; }
+    sudo test -s "$CRED/restic-password" || { echo "Missing $CRED/restic-password — RESTORE.md → Bootstrap step 4"; return 1; }
+    for f in "$HOME/.config/rclone/rclone.conf" "$HOME/.config/backup/restic-password"; do
+        [ -e "$f" ] && { shred -u "$f"; note "removed a user-readable copy of a backup credential: ${f/#$HOME/~} (they live in $CRED only)"; }
+    done
+    sudo install -d -m 700 /var/cache/restic
     restic snapshots --latest 1 --no-lock || return 1
 }
 
 ph_stage() {
-    sudo mkdir -p "$STAGE" && sudo chown "$USER:" "$STAGE"
+    sudo mkdir -p "$STAGE"
     restic restore latest --target "$STAGE" --no-lock || return 1
+    # root restored it (with original owners); the phases below read it as levi. It's deleted after the /etc review.
+    sudo chown -R "$USER:" "$STAGE"
     [ -d "$M" ] && [ -f "$SB/etc.tar.zst" ] || { echo "snapshot is missing the manifest or /etc archive"; return 1; }
     mkdir -p "$STAGE/etc-archive" && tar --zstd -xf "$SB/etc.tar.zst" -C "$STAGE/etc-archive" 2>/dev/null
     sudo chown -R "$USER:" "$STAGE/etc-archive" 2>/dev/null; true
@@ -77,7 +91,8 @@ ph_repos() {
 
 ph_packages() {
     local list="$M/dnf-userinstalled.txt" want="$DONE/packages-wanted.txt"
-    grep -vE '^\s*$' "$list" | sort -u >"$want"
+    # kmod-nvidia-<kernel> packages are built locally by akmods (phase nvidia), never installed from a repo
+    grep -vE '^\s*$|^kmod-' "$list" | sort -u >"$want"
     if [ $REHEARSAL = 1 ]; then   # a VM has no NVIDIA GPU or ThinkPad firmware; kernels come from the image
         grep -vE '^(akmod-|kmod-|xorg-x11-drv-nvidia|nvidia-|kernel|fwupd-plugin)' "$want" >"$want.tmp" && mv "$want.tmp" "$want"
     fi
@@ -94,7 +109,32 @@ ph_packages() {
         [ -n "$manual" ] && note "installed by hand on the old system (not in any repo) — reinstall manually if still wanted: $manual"
         [ -n "$failed" ] && note "available but failed to install (check $LOG): $failed"
     fi
+    # dnf can upgrade libzstd as a dependency without the zstd binary, which then refuses to run
+    # ("incorrect library version") and breaks every later `tar --zstd`. Keep the pair in step.
+    sudo dnf upgrade -y -q zstd libzstd >/dev/null 2>&1
+    zstd --version >/dev/null 2>&1 || note "zstd is broken after the package install (sudo dnf upgrade zstd libzstd)"
     true
+}
+
+ph_nvidia() {
+    # akmod-nvidia only builds at boot or when the akmods service runs. Build it now for every installed kernel,
+    # so the first reboot doesn't come up without a driver.
+    [ $REHEARSAL = 1 ] && { echo "  rehearsal: no NVIDIA GPU, skipped"; return 0; }
+    rpm -q akmod-nvidia >/dev/null 2>&1 || { echo "  akmod-nvidia not installed, skipped"; return 0; }
+    # The newest kernel (the default boot) must have the module; older ones (e.g. the installer's own kernel, which
+    # comes without kernel-devel) are best effort: their kernel-devel is installed if a repo still has it.
+    local k bad="" newest
+    newest=$(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | sort -V | tail -1)
+    for k in $(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n'); do
+        modinfo -k "$k" nvidia >/dev/null 2>&1 && { echo "  nvidia module present for $k"; continue; }
+        rpm -q "kernel-devel-$k" >/dev/null 2>&1 || sudo dnf install -y -q "kernel-devel-$k" >/dev/null 2>&1
+        say "  building nvidia module for $k (a few minutes)"
+        sudo akmods --force --kernels "$k" 2>&1 | tee -a "$LOG" | tail -2
+        modinfo -k "$k" nvidia >/dev/null 2>&1 || bad+="$k "
+    done
+    [[ " $bad " == *" $newest "* ]] && { echo "nvidia module missing for the newest kernel $newest (see /var/cache/akmods/nvidia/*.log). Don't reboot."; return 1; }
+    [ -n "$bad" ] && note "nvidia: no module for older kernel(s) $bad— fine for the default boot ($newest), but don't pick them in the boot menu"
+    note "nvidia: driver built for $([ -z "$bad" ] && echo "every installed kernel" || echo "$newest (the default boot)"); check nvidia-smi after the reboot"
 }
 
 ph_home() {
@@ -123,12 +163,81 @@ ph_home() {
 }
 
 ph_usrlocal() {
-    sudo tar --zstd -xpf "$SB/usr-local.tar.zst" -C / && sudo restorecon -R /usr/local >/dev/null 2>&1; true
+    zstd --version >/dev/null 2>&1 || sudo dnf upgrade -y -q zstd libzstd >/dev/null 2>&1
+    sudo tar --zstd -xpf "$SB/usr-local.tar.zst" -C / || return 1
+    sudo restorecon -R /usr/local >/dev/null 2>&1; true
 }
 
 ph_flatpak() {
     flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo &&
         flatpak install --user -y --noninteractive flathub com.makemkv.MakeMKV
+}
+
+ph_identity() {
+    # Bring THIS laptop's identity back, so nothing paired with it notices the reinstall:
+    #   machine-id (deadman orders name it) · SSH host keys (the phone's known_hosts) · Tailscale node (same name + IP,
+    #   no new "system-1" device) · deadman pairing (/etc/deadman: phone key, order channel, home router, nonce history)
+    # Never in a rehearsal: a VM must not impersonate the laptop on the tailnet or accept the phone's orders.
+    local E="$STAGE/etc-archive/etc" T="$SB/tailscale.tar.zst" k a="" fp
+    if [ $DRY = 1 ]; then
+        [ -d "$E" ] || { echo "  ✘ no staged /etc archive — run: system-restore --phase stage"; return 1; }
+        local okc=0 want=5
+        chk() { if [ "$1" = 1 ]; then echo "  ✔ $2"; okc=$((okc + 1)); else echo "  ✘ $2"; fi; }
+        chk "$([ -s "$E/machine-id" ] && echo 1)" "machine-id ($(head -c 8 "$E/machine-id" 2>/dev/null)…; this system: $(head -c 8 /etc/machine-id)…)"
+        chk "$(ls "$E"/ssh/ssh_host_*_key >/dev/null 2>&1 && echo 1)" "SSH host keys ($(ls "$E"/ssh/ssh_host_*_key 2>/dev/null | wc -l))"
+        chk "$([ -s "$T" ] && echo 1)" "Tailscale node archive ($(du -h "$T" 2>/dev/null | cut -f1))"
+        chk "$([ -s "$E/deadman/allowed_signers" ] && echo 1)" "deadman phone key: $(cut -d' ' -f3- "$E/deadman/allowed_signers" 2>/dev/null | ssh-keygen -lf - 2>/dev/null | awk '{print $2, $3}')"
+        chk "$([ -s "$E/deadman/topic" ] && echo 1)" "deadman order channel + home routers: $(awk '!/^#/ && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' "$E/deadman/trusted_networks" 2>/dev/null | wc -l) trusted (router + public IP) · signed for host '$(grep -o 'deadman@[^"]*' "$E/deadman/allowed_signers" 2>/dev/null | head -1 | cut -d@ -f2)'"
+        echo "  $okc/$want identity pieces in this backup (dry run: nothing changed)"
+        [ $okc = $want ]; return
+    fi
+    if [ $REHEARSAL = 1 ]; then note "rehearsal: identity NOT restored (the VM must never become the laptop)"; return 0; fi
+    [ -d "$E" ] || { echo "  no staged /etc archive — run: system-restore --phase stage"; return 1; }
+
+    if [ -s "$E/machine-id" ] && ! cmp -s "$E/machine-id" /etc/machine-id; then
+        sudo install -m 444 -o root -g root "$E/machine-id" /etc/machine-id && echo "  machine-id restored (fully in effect after the reboot)"
+    fi
+
+    if ls "$E"/ssh/ssh_host_*_key >/dev/null 2>&1; then
+        for k in "$E"/ssh/ssh_host_*_key; do
+            sudo install -m 600 -o root -g root "$k" "/etc/ssh/${k##*/}"
+            [ -f "$k.pub" ] && sudo install -m 644 -o root -g root "$k.pub" "/etc/ssh/${k##*/}.pub"
+        done
+        sudo restorecon -R /etc/ssh 2>/dev/null; echo "  SSH host keys restored (the phone sees the same host key)"
+    fi
+
+    if [ -s "$T" ]; then
+        sudo systemctl stop tailscaled 2>/dev/null
+        sudo tar --zstd --selinux -xpf "$T" -C / && sudo restorecon -R /var/lib/tailscale 2>/dev/null &&
+            echo "  Tailscale node restored (same name + IP; remote/install.sh won't need a login)"
+    else
+        note "identity: this backup has no Tailscale node — remote/install.sh logs in as a NEW device. Remove the old 'system' at login.tailscale.com/admin/machines and rename the new one to 'system' (the phone's ssh config uses its IP: update HostName there too)"
+    fi
+
+    # deadman pairing: the staged copy is user-owned, so YOU confirm the phone key before it's trusted again
+    if [ -s "$E/deadman/allowed_signers" ]; then
+        fp=$(cut -d' ' -f3- "$E/deadman/allowed_signers" | ssh-keygen -lf - 2>/dev/null)
+        # orders are signed for "deadman@<hostname>": keep the old hostname, or every order fails
+        local oldhost; oldhost=$(grep -o 'deadman@[^"]*' "$E/deadman/allowed_signers" | head -1 | cut -d@ -f2)
+        if [ -n "$oldhost" ] && [ "$oldhost" != "$(hostname)" ]; then
+            sudo hostnamectl set-hostname "$oldhost" && echo "  hostname set back to '$oldhost' (deadman orders are signed for it)"
+        fi
+        echo "  deadman phone key in the backup: $fp"
+        echo "  (on the phone, this must match:  ssh-keygen -lf ~/.ssh/deadman_ed25519.pub)"
+        [ -t 0 ] && read -rp "  Restore the deadman pairing (phone key, order channel, home router)? Type yes: " a
+        if [ "$a" = yes ]; then
+            sudo install -d -m 700 -o root -g root /etc/deadman
+            for k in allowed_signers topic trusted_networks state.json; do
+                [ -s "$E/deadman/$k" ] && sudo install -m 600 -o root -g root "$E/deadman/$k" "/etc/deadman/$k"
+            done
+            sudo restorecon -R /etc/deadman 2>/dev/null
+            logger -t deadman -p auth.warning -- "phone signing key RESTORED from backup by $USER (system-restore): $fp"
+            echo "  deadman pairing restored"
+        else
+            note "identity: deadman pairing NOT restored — re-pair: deadman phone-setup → new phone.conf on the phone → deadman arm '<phone key>' → deadman-order test"
+        fi
+    fi
+    true
 }
 
 ph_installers() {
@@ -151,13 +260,17 @@ ph_installers() {
 }
 
 ph_deadman() {
-    # Installs the agent only. Pairing with the phone is manual: a fresh install has a NEW machine-id and gets a NEW
-    # order channel, so the phone's old phone.conf would send orders this laptop rejects ("for another machine").
+    # Installs the agent. The pairing itself came back in phase identity (same machine-id, phone key, order channel);
+    # install.sh keeps existing /etc/deadman files.
     bash "$HOME/.config/deadman/install.sh" </dev/null 2>&1 | tee -a "$LOG" | tail -3 || note "deadman install reported a problem (see $LOG)"
     if [ $REHEARSAL = 1 ]; then note "rehearsal: deadman agent installed, NOT paired (never pair a VM with the phone)"; return 0; fi
-    note "deadman: RE-PAIR THE PHONE. In a real terminal: deadman phone-setup → on the phone replace ~/.config/deadman/phone.conf (and re-copy ~/bin/deadman-order) → deadman arm '<line from: cat ~/.ssh/deadman_ed25519.pub on the phone>' → on the phone: ~/bin/deadman-order test → deadman log shows ACCEPTED"
-    note "remote: phone access is OFF until you run (real terminal, needs a Tailscale browser login): ~/.config/remote/install.sh — it applies the SSH hardening + Tailscale-only firewall zone, then enables sshd. Re-pair deadman AFTER this (phone-setup copies files over ssh)"
-    note "deadman: at home, trust the router again: deadman trust-here. The disk is encrypted now, so 'wipe' is a real crypto-erase: update the deadman section of ~/Projects/fedora-workstation-automation/README.md"
+    note "remote: phone access is OFF until you run (real terminal): ~/.config/remote/install.sh — SSH hardening + Tailscale-only firewall zone, then sshd on. With the Tailscale node restored it needs no login; check it prints 'name: system'"
+    if sudo test -s /etc/deadman/allowed_signers; then
+        note "deadman: pairing restored — prove it from the phone: ~/bin/deadman-order test (deadman log shows ACCEPTED). One 'REJECTED: stale' email right after a restore is normal (the order channel still holds an old order, e.g. the wipe)"
+    else
+        note "deadman: NOT paired. After remote/install.sh: deadman phone-setup → on the phone: scp the new phone.conf + deadman-order → deadman arm '<cat ~/.ssh/deadman_ed25519.pub on the phone>' → deadman-order test → at home, from the phone: deadman-order trust"
+    fi
+    note "restore staging /var/tmp/restore-staging holds a user-readable copy of the OLD /etc (password hashes, host keys, Wi-Fi passwords). Delete it once ~/restore-etc-review.txt is done: sudo rm -rf /var/tmp/restore-staging"
     true
 }
 
@@ -211,12 +324,19 @@ ph_services() {
 }
 
 ph_dconf() {
+    # `dconf load` is all-or-nothing: one key locked by the system (e.g. authselect's login-screen keys in
+    # /etc/dconf/db/*.d/locks/) makes it refuse the whole file. Drop locked keys first.
+    local ini="$DONE/dconf-load.ini"
+    { cat /etc/dconf/db/*.d/locks/* 2>/dev/null | grep '^/'; echo "#END-LOCKS"; } | awk '
+        !body { if ($0 == "#END-LOCKS") body=1; else lock[$0]=1; next }
+        /^\[.*\]$/ { sec=substr($0, 2, length($0)-2); print; next }
+        { k=$0; sub(/=.*/, "", k); if (("/" sec "/" k) in lock) next; print }' - "$M/dconf-full.ini" >"$ini"
     if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dconf >/dev/null && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
-        dconf load / <"$M/dconf-full.ini" && echo "  GNOME settings loaded (log out and back in)"
+        dconf load / <"$ini" || return 1
+        echo "  GNOME settings loaded ($(( $(wc -l <"$M/dconf-full.ini") - $(wc -l <"$ini") )) system-locked keys skipped) — log out and back in"
     else
-        note "no desktop session — run later from GNOME: dconf load / < ~/.local/share/system-manifest/dconf-full.ini"
+        note "no desktop session — GNOME settings NOT loaded. From a terminal inside GNOME: system-restore --phase dconf"
     fi
-    true
 }
 
 ph_etc() {
@@ -224,7 +344,7 @@ ph_etc() {
     local E="$STAGE/etc-archive" out="$HOME/restore-etc-review.txt" f
     {
         echo "# /etc files that differed from package defaults on the old system. Review each; copy with: sudo cp -a $E/etc/<file> /etc/<file>"
-        echo "# Never copy blindly: fstab, crypttab, default/grub, machine-id, hostname (disk UUIDs/identity differ)."
+        echo "# Never copy blindly: fstab, crypttab, default/grub, hostname (disk UUIDs differ). machine-id, SSH host keys, deadman + Tailscale identity came back in phase identity."
         awk '{print $NF}' "$SB/rpm-modified-files.txt" | grep '^/etc/' | sort -u | while read -r f; do
             echo; echo "=== $f"
             if [[ "$f" =~ ^/etc/(fstab|crypttab|default/grub|machine-id|hostname)$ ]]; then echo "(identity/disk file — don't copy)"; continue; fi
@@ -244,6 +364,10 @@ ph_verify() {
 }
 
 # ---------------------------------------------------------------- runner
+if [ $DRY = 1 ]; then
+    [ "$ONLY" = identity ] || { echo "--dry-run only exists for: --phase identity"; exit 2; }
+    say "identity dry run (nothing is changed)"; ph_identity; exit $?
+fi
 say "system-restore$([ $REHEARSAL = 1 ] && echo ' (REHEARSAL)') — log: $LOG"
 for p in "${PHASES[@]}"; do
     [ -n "$ONLY" ] && [ "$p" != "$ONLY" ] && continue

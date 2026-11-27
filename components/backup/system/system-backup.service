@@ -9,11 +9,10 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
+# Runs as ROOT (since 2026-11-27): the credentials in /etc/backup are root-only, so nothing running as levi can read
+# or delete the backups. Writes into levi's home are done as levi inside the script.
 Type=oneshot
-User=levi
-Group=levi
-Environment=HOME=/home/levi BACKUP_USER=levi
-ExecStartPre=+/usr/local/bin/system-backup root-stage
+ExecStartPre=/usr/local/bin/system-backup root-stage
 ExecStart=/usr/local/bin/system-backup run
 Nice=10
 IOSchedulingClass=idle

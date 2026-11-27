@@ -1,42 +1,52 @@
 #!/bin/bash
-# backup — front-end for the nightly Google Drive backup (restic + rclone)
+# backup — front-end for the nightly Google Drive backup (restic + rclone, run as ROOT; credentials root-only in /etc/backup)
 # group: System care
 #   backup            run a backup now (same as the midnight job) and stream its log
-#   backup status     next/last run, last result, recent snapshots
+#   backup status     next/last run, last result, latest checks + sizes (no sudo: reads the root job's results)
+#   backup verify     run the full verification now: real restores from Drive compared with the live files
 #   backup log        last run's full log
-#   backup snapshots  list all snapshots
-#   backup ls [snap] [path]          browse files in a snapshot (default: latest)
-#   backup restore <path> [snap]     restore a file/dir from a snapshot into ~/restored/
-#   backup restic <args...>          run any restic command against the repo
+#   backup snapshots  list all snapshots                         (sudo)
+#   backup ls [snap] [path]          browse files in a snapshot   (sudo)
+#   backup restore <path> [snap]     restore a file/dir into ~/restored/   (sudo)
+#   backup restic <args...>          any restic command on the repo        (sudo)
 set -uo pipefail
-source "$HOME/.config/backup/env"
-B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
+B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; D=$'\e[2m'; N=$'\e[0m'
 UNIT=system-backup.service
+SB=/usr/local/bin/system-backup
+ST="$HOME/.local/state/backup"
+
+follow() {   # follow <unit> <title>: start a root job (polkit allows it without a password) and stream its log
+    echo "${B}${C}▶ $2${N} (Ctrl-C stops watching; the job keeps running)"
+    journalctl -u "$1" -f -n0 --since "$(date '+%F %T')" -o cat & local jpid=$!
+    systemctl start "$1"; local rc=$?
+    sleep 1; kill $jpid 2>/dev/null
+    if [ $rc -eq 0 ]; then echo "${G}${B}✔ done${N}"; else echo "${R}${B}✘ failed${N} — see: journalctl -u $1 -n 100"; fi
+    return $rc
+}
+needs_sudo() { [ -t 0 ] || { echo "This needs sudo in your own terminal (the backup credentials are root-only)."; exit 1; }; }
 
 case "${1:-now}" in
-    now|run)
-        echo "${B}${C}▶ Starting backup${N} (Ctrl-C stops watching; the backup keeps running)"
-        since=$(date '+%F %T')
-        journalctl -u "$UNIT" -f -n0 --since "$since" -o cat &
-        jpid=$!
-        systemctl start "$UNIT"; rc=$?
-        sleep 1; kill $jpid 2>/dev/null
-        if [ $rc -eq 0 ]; then echo "${G}${B}✔ Backup finished${N}"; else echo "${R}${B}✘ Backup failed${N} — see: backup log"; fi
-        exit $rc ;;
+    now|run) follow "$UNIT" "Starting backup"; exit $? ;;
+    verify)  follow backup-verify.service "Verifying: real restores from Drive"; exit $? ;;
     status)
-        echo "${B}Timer${N}"; systemctl list-timers nightly-maintenance.timer --no-pager | head -2
-        echo; echo "${B}Last result${N}: $(cat "$HOME/.local/state/backup/last-result" 2>/dev/null || echo never run)"
-        echo; echo "${B}Recent snapshots${N}"; restic snapshots --latest 5 --compact
-        echo; restic stats --mode raw-data 2>/dev/null | grep -E 'Total Size|Snapshots' ;;
+        echo "${B}Timer${N}"; systemctl list-timers nightly-maintenance.timer backup-verify.timer --no-pager | head -3
+        echo; echo "${B}Last backup${N}: $(cat "$ST/last-result" 2>/dev/null || echo never run)"
+        if [ -f "$ST/verify.json" ]; then
+            jq -r '
+              def line(c): (c | to_entries[] | select(.key | startswith("_") | not) |
+                "  \(if .value.ok == true then "✔" elif .value.ok == false then "✘" else "–" end) \(.key): \(.value.msg)");
+              "\nChecks (quick, \(.quick.time | strflocaltime("%a %H:%M"))):", line(.quick.checks),
+              (if .full then "\nRestore test (full, \(.full.time | strflocaltime("%a %b %d %H:%M"))):", line(.full.checks | with_entries(select(.key | IN("drive_quota","restore_random_files","movies_restore_sample")))) else "\nRestore test: not run yet (backup verify)" end),
+              "\nSize: backup \((.quick.checks._stats.backup_bytes // 0) / 1073741824 * 10 | floor / 10) GiB · movies \((.quick.checks._stats.movies_bytes // 0) / 1073741824 | floor) GiB"
+            ' "$ST/verify.json"
+        else echo "${D}  no verification results yet (written after the next backup)${N}"; fi ;;
     log)        journalctl -u "$UNIT" -b -n 300 --no-pager -o short-iso | less -R +G ;;
-    snapshots)  restic snapshots --compact ;;
-    ls)         restic ls "${2:-latest}" ${3:+"$3"} ;;
+    snapshots)  needs_sudo; sudo "$SB" restic snapshots --compact ;;
+    ls)         needs_sudo; sudo "$SB" restic ls "${2:-latest}" ${3:+"$3"} ;;
     restore)
         [ -z "${2:-}" ] && { echo "usage: backup restore <path> [snapshot]"; exit 2; }
-        mkdir -p "$HOME/restored"
-        restic restore "${3:-latest}" --include "$2" --target "$HOME/restored" &&
-            echo "${G}Restored into ~/restored${2}${N}" ;;
-    restic)     shift; restic "$@" ;;
+        needs_sudo; sudo "$SB" restore "$2" "${3:-latest}" ;;
+    restic)     needs_sudo; shift; sudo "$SB" restic "$@" ;;
     -h|--help|help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); if (!/^group:/) print; next} NR>1 {exit}' "$0" ;;
     *) echo "unknown command: $1 (try: backup help)"; exit 2 ;;
 esac

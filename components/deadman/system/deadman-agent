@@ -9,9 +9,12 @@ Every order (valid or not) is logged (journal tag: deadman) and emailed.
 
 Away alert: every run also checks WHICH network the laptop is on, identified by the router's hardware (MAC) address
 (a Wi-Fi name can be copied; a router MAC is much harder to fake). If it isn't a trusted home router
-(/etc/deadman/trusted_networks, added with `deadman trust-here`), a silent high-priority email goes out with the location
-and the exact phone orders to send. Once per new network, again when it comes back online after 30+ min offline, and a
-reminder every 4 h while it stays away. Paused by `deadman away pause <time>` (trips); muted while lost mode reports anyway.
+(/etc/deadman/trusted_networks), a silent high-priority email goes out with the location and the exact phone orders to
+send. Once per new network, again when it comes back online after 30+ min offline, and a reminder every 4 h while it
+stays away. Muted while lost mode reports anyway.
+Trusting a network and pausing alerts are PHONE-ONLY signed orders (nothing on the laptop can do either, so a thief at
+the keyboard can't silence them): `trust` / `untrust` (the router the laptop is on right now), `away-pause` (with a
+duration, 1h–30d) / `away-resume`.
 
   deadman-agent            poll for orders (deadman-agent.timer)
   deadman-agent --selftest prove the verification logic with a throwaway key (changes nothing)
@@ -28,7 +31,16 @@ HOST = os.uname().nodename
 NAMESPACE = f"deadman@{HOST}"
 PRINCIPAL = "deadman"
 MAX_AGE = 15 * 60
-ACTIONS = ("test", "locate", "lost", "found", "lock", "unlock", "scrub", "wipe")
+ACTIONS = ("test", "locate", "lost", "found", "lock", "unlock", "scrub", "wipe", "trust", "untrust", "away-pause", "away-resume")
+MAX_PAUSE = 30 * 86400
+
+
+def pause_seconds(s):
+    """'12h' / '3d' → seconds (1h..30d), else None."""
+    m = re.fullmatch(r"([0-9]{1,3})([hd])", s or "")
+    if not m: return None
+    secs = int(m[1]) * (3600 if m[2] == "h" else 86400)
+    return secs if 3600 <= secs <= MAX_PAUSE else None
 TRUSTED_F, PAUSE_F = f"{ETC}/trusted_networks", f"{ETC}/away_pause"
 AWAY_REMIND, OFFLINE_GAP = 4 * 3600, 30 * 60
 
@@ -75,6 +87,8 @@ def verify(order_text, sig_text, signers_file, seen_nonces, now=None, machine=MA
     if f.get("action") not in ACTIONS: return False, f"unknown action {f.get('action')!r}", f
     if f["action"] == "wipe" and f.get("confirm") != f"WIPE {machine[:8]}":
         return False, "wipe confirmation phrase missing or wrong", f
+    if f["action"] == "away-pause" and pause_seconds(f.get("for")) is None:
+        return False, "away-pause needs a duration between 1h and 30d (e.g. for: 3d)", f
     return True, "verified", f
 
 
@@ -131,9 +145,48 @@ def current_network():
     return mac, f"{name or dev} via {dev}, router {gw} [{mac}]"
 
 
+# "Home" = the router's MAC AND home's public IP, both at once (2026-11-27). A thief can copy a router MAC onto their
+# own router, but their network can't have this home's public IP, so home can't be faked from anywhere else.
+# trusted_networks lines: "<router mac> <public ipv4>  <label>". Old MAC-only lines don't count: re-send `trust`.
+IPV4 = re.compile(r"(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)")
+IP_UNKNOWN_LIMIT = 5          # checks (~10 min) the home router may be seen without a confirmable public IP
+
+
 def trusted_networks(path=TRUSTED_F):
-    try: return {l.split()[0].lower() for l in open(path) if l.strip() and not l.startswith("#")}
-    except OSError: return set()
+    """{'mac|ip', …} from the trust file."""
+    out = set()
+    try:
+        for l in open(path):
+            f = l.split()
+            if len(f) >= 2 and not l.startswith("#") and IPV4.fullmatch(f[1]): out.add(f"{f[0].lower()}|{f[1]}")
+    except OSError: pass
+    return out
+
+
+def public_ip():
+    """This network's public IPv4 as the internet sees it, or None (offline / blocked)."""
+    for url in ("https://api.ipify.org", "https://ipinfo.io/ip"):
+        try:
+            ip = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "deadman-agent"}), timeout=10).read().decode().strip()
+            if IPV4.fullmatch(ip): return ip
+        except Exception: continue
+    return None
+
+
+def network_key(mac, ip, trusted, st):
+    """Identity of the current network for away_decision. Pure apart from st's unknown-IP counter.
+    Unknown routers: just the MAC (no IP lookup needed). The home router's MAC: MAC|public IP, so a spoofed MAC on another
+    network is a different key. If the IP can't be checked for IP_UNKNOWN_LIMIT checks in a row, it counts as NOT home
+    (fail safe: blocking the IP lookup can't hide a stolen laptop). Returns (key, note) — key None = undecided this run."""
+    if mac not in {k.split("|")[0] for k in trusted}: st["ip_unknown"] = 0; return mac, ""
+    if ip:
+        st["ip_unknown"] = 0
+        key = f"{mac}|{ip}"
+        return key, ("" if key in trusted else f"router matches home but the public IP {ip} doesn't (a copied router address, "
+                                                "or your ISP changed your IP: if you ARE home, send deadman-order trust)")
+    st["ip_unknown"] = st.get("ip_unknown", 0) + 1
+    if st["ip_unknown"] < IP_UNKNOWN_LIMIT: return None, "home router seen, public IP not confirmed yet"
+    return f"{mac}|unknown", "router matches home but its public IP can't be checked (lookups blocked?)"
 
 
 def away_decision(fp, trusted, st, now):
@@ -150,6 +203,36 @@ def away_decision(fp, trusted, st, now):
     if now - a["last_alert"] > AWAY_REMIND:
         a["last_alert"] = now; return f"reminder: still away from home ({int((now - a['since']) // 3600)} h so far)"
     return None
+
+
+def write_root(path, text):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh: fh.write(text)
+    os.chmod(tmp, 0o600); os.replace(tmp, path)
+
+
+def act_trust(st, add):
+    """Phone order: (un)trust the router this laptop is on RIGHT NOW."""
+    mac, label = current_network()
+    if not mac: return f"Nothing changed: can't identify the network ({label}). Is the laptop online?"
+    lines = [l for l in (open(TRUSTED_F).read().splitlines() if os.path.exists(TRUSTED_F) else []) if l.strip()]
+    known = any(l.split()[0].lower() == mac for l in lines if not l.startswith("#"))
+    if add:
+        ip = public_ip()
+        if not ip: return f"Nothing changed: couldn't confirm this network's public IP ({label}). Try again in a few minutes."
+        if f"{mac}|{ip}" in trusted_networks(): return f"Already trusted: {label}, public IP {ip}"
+        # one entry per router: re-trusting after an ISP IP change replaces the old IP
+        lines = [l for l in lines if l.startswith("#") or l.split()[0].lower() != mac]
+        lines.append(f"{mac} {ip}  {label} (trusted by phone order {time.strftime('%F')})")
+        label += f", public IP {ip}"
+        st.pop("away", None); st["ip_unknown"] = 0
+    else:
+        if not known: return f"Wasn't trusted: {label}"
+        lines = [l for l in lines if l.startswith("#") or l.split()[0].lower() != mac]
+    write_root(TRUSTED_F, "\n".join(lines) + ("\n" if lines else ""))
+    log(f"network {'TRUSTED' if add else 'UNTRUSTED'} by phone order: {label}", "warning")
+    return (("Away alerts will no longer fire on: " if add else "Away alerts fire again on: ") + label +
+            f". Trusted routers now: {sum(1 for l in lines if not l.startswith('#'))}")
 
 
 def pause_until():
@@ -178,7 +261,7 @@ On it since {since} · laptop up {up // 60} h {up % 60} min · signed in: {rep.p
 WHERE IT IS
 {fmt(rep)}
 
-IF THIS WAS YOU: ignore this email. Travelling? On the laptop: deadman away pause 3d
+IF THIS WAS YOU: ignore this email. Travelling? From the phone: ~/bin/deadman-order away-pause 3d
 
 IF IT WASN'T YOU, in the phone's Terminal app, in this order:
 {steps}
@@ -191,9 +274,13 @@ Next reminder in 4 h if it stays on this network."""
 def away_check(st, armed):
     """Returns a one-line status for status.json."""
     trusted = trusted_networks()
-    fp, label = current_network()
-    if not trusted: return "no home network trusted yet (deadman trust-here)"
-    if fp is None: return label
+    mac, label = current_network()
+    if not trusted: return "no home network trusted yet (at home, from the phone: deadman-order trust)"
+    if mac is None: return label
+    home_mac = mac in {k.split("|")[0] for k in trusted}
+    fp, why_note = network_key(mac, public_ip() if home_mac else None, trusted, st)
+    if fp is None: return why_note
+    if why_note: label += " — " + why_note
     why = away_decision(fp, trusted, st, time.time())
     paused = pause_until()
     if fp in trusted: return "home"
@@ -222,15 +309,16 @@ def act_unlock():
 
 SCRUB = [".config/backup/restic-password", ".config/rclone", ".config/gh", ".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa",
          ".config/google-chrome", ".mozilla", ".claude/.credentials.json", ".local/share/keyrings", ".config/watcher/healthchecks-url",
-         ".dotfiles/config", "Documents/keys"]
+         ".dotfiles/config", "Documents/keys", ".config/watcher/smtp-netrc"]
+# outside the home folder: the root-only backup credentials (since 2026-11-27) and the Tailscale node key
+SCRUB_ABS = ["/etc/backup/rclone.conf", "/etc/backup/restic-password", "/var/cache/restic", "/var/lib/system-backup"]
 
 
 def act_scrub():
     h, gone = home(), []
-    for rel in SCRUB:
-        p = os.path.join(h, rel)
+    for p in [os.path.join(h, rel) for rel in SCRUB] + SCRUB_ABS:
         if os.path.lexists(p):
-            run(["rm", "-rf", "--one-file-system", p]); gone.append(rel)
+            run(["rm", "-rf", "--one-file-system", p]); gone.append(p.replace(h, "~"))
     run(["tailscale", "logout"])  # (orders still arrive: they're pulled over the internet, not Tailscale)
     return "removed: " + (", ".join(gone) or "nothing found") + "; Tailscale logged out. Also revoke: Google sessions, GitHub token, Tailscale device."
 
@@ -310,6 +398,17 @@ def poll():
         elif a == "unlock": email("unlocked", act_unlock())
         elif a == "scrub": email("SCRUBBED", act_scrub())
         elif a == "wipe": save_state(st); act_wipe()
+        elif a == "trust": email("home network trusted", act_trust(st, add=True))
+        elif a == "untrust": email("network no longer trusted", act_trust(st, add=False))
+        elif a == "away-pause":
+            until = int(time.time()) + pause_seconds(f["for"])
+            write_root(PAUSE_F, f"{until}\n")
+            email("away alerts paused", "Away-from-home alerts are paused until " + time.strftime("%a %b %d %H:%M", time.localtime(until)) +
+                  ". End early from the phone: deadman-order away-resume")
+        elif a == "away-resume":
+            try: os.remove(PAUSE_F)
+            except FileNotFoundError: pass
+            email("away alerts resumed", "Away-from-home alerts are on again.")
     if st.get("lost") and time.time() - st.get("last_lost_report", 0) > 600:
         st["last_lost_report"] = time.time(); email("lost mode: location", fmt(locate()))
     save_state(st); write_status(st, armed, away=away)
@@ -323,9 +422,9 @@ def selftest():
         signers = f"{d}/signers"
         open(signers, "w").write(f'{PRINCIPAL} namespaces="{NAMESPACE}" {open(key + ".pub").read().strip()}\n')
 
-        def order(action="test", machine=MACHINE, issued=None, nonce=None, confirm="", k=key, ns=NAMESPACE):
+        def order(action="test", machine=MACHINE, issued=None, nonce=None, confirm="", k=key, ns=NAMESPACE, extra=""):
             t = (f"deadman-order v1\nmachine: {machine}\naction: {action}\nissued: {int(issued or time.time())}\n"
-                 f"nonce: {nonce or secrets.token_hex(16)}\n" + (f"confirm: {confirm}\n" if confirm else ""))
+                 f"nonce: {nonce or secrets.token_hex(16)}\n" + (f"confirm: {confirm}\n" if confirm else "") + extra)
             p = f"{d}/o-{secrets.token_hex(4)}"; open(p, "w").write(t)     # fresh file: ssh-keygen won't overwrite a .sig
             run(["ssh-keygen", "-Y", "sign", "-f", k, "-n", ns, p])
             return t, open(p + ".sig").read()
@@ -342,6 +441,11 @@ def selftest():
             ("wipe without confirmation", order(action="wipe"), False),
             ("wipe with wrong confirmation", order(action="wipe", confirm="WIPE 00000000"), False),
             ("wipe with correct confirmation", order(action="wipe", confirm=f"WIPE {MACHINE[:8]}"), True),
+            ("trust (phone-only home network)", order(action="trust"), True),
+            ("away-pause without duration", order(action="away-pause"), False),
+            ("away-pause 3d", order(action="away-pause", extra="for: 3d\n"), True),
+            ("away-pause 90d (too long)", order(action="away-pause", extra="for: 90d\n"), False),
+            ("away-pause 10m (too short)", order(action="away-pause", extra="for: 10m\n"), False),
         ]
         o, s = order(); cases.append(("tampered after signing", (o.replace("action: test", "action: wipe"), s), False))
         bad = 0
@@ -352,22 +456,32 @@ def selftest():
 
         # away-alert decisions (pure; fake clock)
         home, cafe, other, H = "aa:aa:aa:aa:aa:aa", "bb:bb:bb:bb:bb:bb", "cc:cc:cc:cc:cc:cc", 3600
-        tf = f"{d}/trusted"; open(tf, "w").write(f"# comment\n{home.upper()}  home router\n")
+        HOME_IP, THIEF_IP, NEW_ISP_IP = "203.0.113.5", "198.51.100.7", "203.0.113.99"
+        tf = f"{d}/trusted"
+        open(tf, "w").write(f"# comment\n{home.upper()} {HOME_IP}  home router\n{cafe.upper()}  old MAC-only line (ignored)\n")
         tr, st, t, abad = trusted_networks(tf), {}, 1_000_000, 0
-        # (what happens, network, offline seconds before, minutes online with a check every 2 min, alerts expected)
-        steps = [("a day at home", home, 0, 24 * 60, 0),
-                 ("joins a cafe, stays 3 h", cafe, 0, 180, 1),
-                 ("stays 2 h more (4 h reminder)", cafe, 0, 120, 1),
-                 ("moves to another network", other, 0, 10, 1),
-                 ("asleep 1 h, wakes on same network", other, H, 10, 1),
-                 ("asleep 10 min, wakes on same network", other, 600, 10, 0),
-                 ("back home", home, 0, 60, 0),
-                 ("home overnight offline, wakes at home", home, 10 * H, 10, 0),
-                 ("cafe again", cafe, 0, 10, 1)]
-        for name, fp, off, mins, want in steps:
+        if tr != {f"{home}|{HOME_IP}"}: abad += 1; print(f"✘ away: trust file parsed as {tr}")
+        # (what happens, router MAC, its public IP (None = lookup fails), offline secs before, minutes online, alerts expected)
+        steps = [("a day at home", home, HOME_IP, 0, 24 * 60, 0),
+                 ("joins a cafe, stays 3 h", cafe, None, 0, 180, 1),
+                 ("stays 2 h more (4 h reminder)", cafe, None, 0, 120, 1),
+                 ("moves to another network", other, None, 0, 10, 1),
+                 ("asleep 1 h, wakes on same network", other, None, H, 10, 1),
+                 ("asleep 10 min, wakes on same network", other, None, 600, 10, 0),
+                 ("back home", home, HOME_IP, 0, 60, 0),
+                 ("home overnight offline, wakes at home", home, HOME_IP, 10 * H, 10, 0),
+                 ("thief copies the home router's MAC", home, THIEF_IP, 0, 10, 1),
+                 ("back home again", home, HOME_IP, 0, 10, 0),
+                 ("thief copies the MAC and blocks IP lookups", home, None, 0, 20, 1),
+                 ("back home, lookups work", home, HOME_IP, 0, 10, 0),
+                 ("home, ISP changed the public IP", home, NEW_ISP_IP, 0, 10, 1),
+                 ("cafe again", cafe, None, 0, 10, 1)]
+        for name, mac, ip, off, mins, want in steps:
             t += off; got = 0
             for _ in range(max(1, mins // 2)):
-                t += 120; got += away_decision(fp, tr, st, t) is not None
+                t += 120
+                fp, _note = network_key(mac, ip, tr, st)
+                if fp is not None: got += away_decision(fp, tr, st, t) is not None
             if got != want: abad += 1; print(f"✘ away: {name}: expected {want} alert(s), got {got}")
         print(f"{len(steps) - abad}/{len(steps)} away-alert checks correct")
         return 0 if bad == 0 and abad == 0 else 1

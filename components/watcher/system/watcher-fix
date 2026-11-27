@@ -12,7 +12,7 @@ Only applies known-safe, idempotent fixes. Everything else is reported for a hum
 Root-owned copy at /usr/local/bin/watcher-fix, installed from ~/.config/watcher/system/ by ~/.config/watcher/install.sh.
 It never executes user-writable code as root: user-side steps run as the user via runuser.
 """
-import glob, json, os, pwd, re, subprocess, sys, time
+import glob, json, os, pwd, re, subprocess, sys, tempfile, time
 
 USER = os.environ.get("WATCHER_USER", "levi")
 PW = pwd.getpwnam(USER)
@@ -211,28 +211,33 @@ def check_system():
 
 # ---------------------------------------------------------------- user-side fixes
 def check_user():
-    env_ok = os.path.exists(f"{HOME}/.config/backup/env")
-    if env_ok:
-        src = f"source {HOME}/.config/backup/env && "
+    # The backup credentials are root-only (/etc/backup, since 2026-11-27): these checks run only as root,
+    # through the root-owned settings, never through anything in levi's home.
+    sb = "/usr/local/bin/system-backup"
+    if ROOT and os.path.exists(sb) and os.path.exists("/etc/backup/env"):
+        src = "source /etc/backup/env && "
         # stale restic locks (left by an interrupted run) block backups; unlock only removes stale ones
-        r = run(["bash", "-c", src + "restic list locks --no-lock 2>/dev/null | wc -l"], user=True, timeout=180)
-        if r.stdout.strip() not in ("", "0") and run(["systemctl", "is-active", "system-backup"]).stdout.strip() != "activating":
+        r = run([sb, "restic", "list", "locks", "--no-lock"], timeout=180)
+        if any(l.strip() for l in r.stdout.splitlines()) and run(["systemctl", "is-active", "system-backup"]).stdout.strip() != "activating":
             fix("backup repo had a leftover lock — removed stale locks (restic unlock)",
-                lambda: run(["bash", "-c", src + "restic unlock"], user=True, timeout=300).returncode == 0)
+                lambda: run([sb, "restic", "unlock"], timeout=300).returncode == 0)
         # Drive login still valid?
-        r = run(["bash", "-c", src + "rclone lsf --max-depth 1 \"$RCLONE_REMOTE_DIR\""], user=True, timeout=120)
+        r = run(["bash", "-c", src + "rclone lsf --max-depth 1 \"$RCLONE_REMOTE_DIR\""], timeout=120)
         if r.returncode != 0:
             if re.search(r"invalid_grant|token|unauthor|401", r.stderr, re.I):
-                report("Google Drive login expired — run in a terminal: rclone config reconnect gdrive:")
+                report("Google Drive login expired — reconnect it (RESTORE.md step 2), then: sudo install -m 600 <new rclone.conf> /etc/backup/rclone.conf")
             else:
                 report(f"Google Drive unreachable: {r.stderr.strip()[-120:]}")
         else:
-            # plain-text restore guide on Drive should match local
-            r2 = run(["bash", "-c", src + "rclone cat \"$RCLONE_REMOTE_DIR/RESTORE.md\""], user=True, timeout=120)
-            if r2.returncode == 0 and r2.stdout != open(f"{HOME}/.config/backup/RESTORE.md").read():
-                fix("RESTORE.md on Drive was out of date — uploaded the current one",
-                    lambda: run(["bash", "-c", src + "rclone copyto ~/.config/backup/RESTORE.md \"$RCLONE_REMOTE_DIR/RESTORE.md\""],
-                                user=True, timeout=120).returncode == 0)
+            # plain-text restore guide on Drive should match local (local copy read AS levi)
+            r2 = run(["bash", "-c", src + "rclone cat \"$RCLONE_REMOTE_DIR/RESTORE.md\""], timeout=120)
+            local = run(["cat", f"{HOME}/.config/backup/RESTORE.md"], user=True).stdout
+            if r2.returncode == 0 and local and r2.stdout != local:
+                def upload():
+                    with tempfile.NamedTemporaryFile("w", delete=False) as fh: fh.write(local)
+                    try: return run(["bash", "-c", src + f"rclone copyto {fh.name} \"$RCLONE_REMOTE_DIR/RESTORE.md\""], timeout=120).returncode == 0
+                    finally: os.remove(fh.name)
+                fix("RESTORE.md on Drive was out of date — uploaded the current one", upload)
     # installed root scripts vs. source: reported, never auto-installed (root must not copy user-writable code)
     pairs = [("backup/system/system-backup", "system-backup"), ("update/system/system-update", "system-update"),
              ("disk-health/system/disk-health", "disk-health"), ("watcher/system/watcher-notify", "watcher-notify"),

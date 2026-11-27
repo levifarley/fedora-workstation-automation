@@ -1,10 +1,14 @@
-# Sourced by system-backup and the `backup` command
-export RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf"
+# Backup settings: TEMPLATE. The live copy is /etc/backup/env (root-owned, mode 600), installed from here by
+# ~/.config/backup/install.sh after you review the change. Every restic job runs as ROOT and reads only /etc/backup,
+# so nothing running as levi (Claude included) can read the credentials, or edit what root executes.
+# No secrets in this file; the credentials themselves live only in /etc/backup (never in git, never in ~).
+export BACKUP_USER=levi
+export RCLONE_CONFIG=/etc/backup/rclone.conf
 export RCLONE_REMOTE_DIR="gdrive:fedora-backup"
 export RESTIC_REPOSITORY="rclone:${RCLONE_REMOTE_DIR}/restic"
-export RESTIC_PASSWORD_FILE="$HOME/.config/backup/restic-password"
-export RESTIC_CACHE_DIR="$HOME/.cache/restic"
-# Pruned data must be deleted for real — Drive trash counts against your quota
+export RESTIC_PASSWORD_FILE=/etc/backup/restic-password
+export RESTIC_CACHE_DIR=/var/cache/restic
+# Pruned data must be deleted for real: Drive trash counts against your quota
 export RCLONE_DRIVE_USE_TRASH=false
 # Be gentle with the Drive API (avoids rateLimitExceeded / 500s)
 export RCLONE_TPSLIMIT=8

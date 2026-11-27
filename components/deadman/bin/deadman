@@ -4,12 +4,11 @@
 #   deadman                 status: agent polling, armed with your phone key, encrypted disk (needed for a real wipe), lost mode
 #   deadman where           where this laptop thinks it is right now (Wi-Fi + IP location; nothing is sent anywhere)
 #   deadman log             orders received (accepted and rejected) + away alerts sent
-#   deadman trust-here      YOU run this at home: trust this router, so being on it never sends an away alert (sudo)
-#   deadman away            away-alert state;  deadman away pause 3d (trips, max 30d)  ·  deadman away resume
+#   deadman away            away-alert state (trusting home + pausing alerts are phone-only orders)
 #   deadman selftest        prove the signature checks with a throwaway key (changes nothing)
 #   deadman phone-setup     YOU run this: phone steps + your private order channel (needs sudo, real terminal)
 #   deadman arm '<key>'     YOU run this: trust your phone's deadman public key (sudo, real terminal)
-# Orders are sent from the phone: deadman-order test|locate|lost|found|lock|unlock|scrub|wipe
+# Orders are sent from the phone: deadman-order test|locate|lost|found|lock|unlock|scrub|wipe|trust|untrust|away-pause <1h-30d>|away-resume
 # Nothing on this laptop can create a valid order — Claude can't arm keys, sign, or run the agent (guard-blocked).
 set -uo pipefail
 B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; N=$'\e[0m'
@@ -37,45 +36,17 @@ PY
         systemctl is-active -q deadman-agent.timer && echo "${D}  timer: every 2 min · orders log: deadman log${N}" ;;
     where)   python3 -I "$AGENT" --locate ;;
     log)     journalctl -t deadman --since -30d --no-pager -o short-iso | tail -30 ;;
-    trust-here)
-        need_tty
-        read -r gw dev < <(ip -j route show default | jq -r '[.[] | select(.gateway)] | min_by(.metric // 0) | "\(.gateway) \(.dev)"' 2>/dev/null)
-        [ -n "${gw:-}" ] && [ "$gw" != null ] || { echo "${R}Not online — connect to your home network first.${N}"; exit 1; }
-        ping -c 1 -W 2 -I "$dev" "$gw" >/dev/null 2>&1
-        mac=$(ip -j neigh show "$gw" dev "$dev" | jq -r '[.[] | select(.lladdr)][0].lladdr // empty' | tr 'A-F' 'a-f')
-        name=$(nmcli -t -g GENERAL.CONNECTION device show "$dev" 2>/dev/null)
-        [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || { echo "${R}Couldn't read the router's hardware address.${N}"; exit 1; }
-        echo "Trust this as ${B}HOME${N}? Being on it will never send an away alert."
-        echo "   ${B}${name:-$dev}${N}  router $gw  [$mac]"
-        read -rp "Only do this on your own home network. Type yes: " ans; [ "$ans" = yes ] || { echo "nothing changed"; exit 1; }
-        if sudo grep -qi "^$mac" /etc/deadman/trusted_networks 2>/dev/null; then echo "${G}✔ already trusted${N}"; exit 0; fi
-        printf '%s  %s (added %s)\n' "$mac" "${name:-$dev}" "$(date +%F)" | sudo tee -a /etc/deadman/trusted_networks >/dev/null &&
-            sudo chmod 600 /etc/deadman/trusted_networks &&
-            logger -t deadman -p auth.warning -- "home network TRUSTED by $USER: ${name:-$dev} [$mac]" &&
-            { /usr/local/bin/watcher-alert "deadman: home network trusted" "Away alerts will not fire on: ${name:-$dev} [$mac]. If this was not you, act now." || true; } &&
-            echo "${G}✔ trusted.${N} Away alerts now fire on any other network." ;;
+    trust-here|trust|untrust)
+        echo "${Y}Phone only${N}, so nobody at this keyboard can silence the away alerts. With the laptop on the network,"
+        echo "send from the phone:  ${B}~/bin/deadman-order trust${N}   (or: untrust)" ; exit 2 ;;
     away)
         case "${2:-}" in
-            pause)
-                need_tty
-                [[ "${3:-}" =~ ^([0-9]+)([hd])$ ]] || { echo "usage: deadman away pause 12h | 3d   (max 30d)"; exit 2; }
-                unit=86400; [ "${BASH_REMATCH[2]}" = h ] && unit=3600
-                secs=$(( 10#${BASH_REMATCH[1]} * unit ))
-                (( secs > 0 && secs <= 30 * 86400 )) || { echo "between 1h and 30d"; exit 2; }
-                until=$(( $(date +%s) + secs )); when=$(date -d "@$until" '+%a %b %d %H:%M')
-                echo "$until" | sudo tee /etc/deadman/away_pause >/dev/null && sudo chmod 600 /etc/deadman/away_pause &&
-                    logger -t deadman -p auth.warning -- "away alerts PAUSED by $USER until $when" &&
-                    { /usr/local/bin/watcher-alert "deadman: away alerts paused" "Away-from-home alerts are paused until $when. If this was not you, act now." || true; } &&
-                    echo "${G}✔ away alerts paused until $when${N} (deadman away resume to end early)" ;;
-            resume)
-                need_tty
-                sudo rm -f /etc/deadman/away_pause && logger -t deadman -- "away alerts resumed by $USER" &&
-                    echo "${G}✔ away alerts on again${N}" ;;
-            "")
+            pause|resume)
+                echo "${Y}Phone only:${N} ${B}~/bin/deadman-order away-pause 3d${N}  ·  ${B}~/bin/deadman-order away-resume${N}"; exit 2 ;;
+            *)
                 python3 -c 'import json; print("network: " + (json.load(open("/var/lib/deadman/status.json")).get("away") or "not checked yet"))' 2>/dev/null ||
                     echo "agent hasn't run yet"
-                echo "${D}  trust home: deadman trust-here · trip: deadman away pause 3d · end pause: deadman away resume${N}" ;;
-            *) echo "usage: deadman away [pause 12h|3d | resume]"; exit 2 ;;
+                echo "${D}  from the phone: deadman-order trust (at home) · away-pause 3d (trips) · away-resume${N}" ;;
         esac ;;
     selftest) python3 -I "$AGENT" --selftest ;;
     phone-setup)

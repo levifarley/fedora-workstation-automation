@@ -519,15 +519,10 @@ def gib(b): return f"{b / 2**30:.1f} GiB" if b is not None else "?"
 
 def collect_metrics():
     m = {"date": time.strftime("%F")}
-    envsh = f"source {HOME}/.config/backup/env && "
-    for key, repo in (("backup_bytes", "restic"), ("movies_bytes", "movies")):
-        r = subprocess.run(["bash", "-c", envsh + f'restic -r "rclone:$RCLONE_REMOTE_DIR/{repo}" stats --mode raw-data --no-lock --json'],
-                           capture_output=True, text=True, timeout=900)
-        try: m[key] = json.loads(r.stdout)["total_size"]
-        except (ValueError, KeyError): m[key] = None
-    r = subprocess.run(["bash", "-c", envsh + "rclone about gdrive: --json"], capture_output=True, text=True, timeout=120)
-    try: j = json.loads(r.stdout); m["drive_used"], m["drive_total"] = j.get("used"), j.get("total")
-    except ValueError: pass
+    # sizes come from the root backup job's verification (the repos are root-only since 2026-11-27)
+    try: s = json.load(open(f"{HOME}/.local/state/backup/verify.json"))["quick"]["checks"]["_stats"]
+    except (OSError, ValueError, KeyError, TypeError): s = {}
+    for key in ("backup_bytes", "movies_bytes", "drive_used", "drive_total"): m[key] = s.get(key)
     dh = f"{HOME}/.local/state/disk-health/last-result"
     if os.path.exists(dh):
         w = re.search(r"NVMe (\d+)% worn", open(dh).read()); m["nvme_worn"] = int(w[1]) if w else None

@@ -22,7 +22,7 @@ which swaps personal details for placeholders and refuses to finish if anything 
 | 👁 | [`watcher`](components/watcher) | Oversees every scheduled job, runs a 47-test end-to-end suite, auto-fixes safe problems, sends alerts, weekly report |
 | 🛡 | [`claude-guard`](components/claude-guard) | Root-owned hook that sees every AI agent action **before** it runs: blocks, asks or logs. [Deep dive ↓](#the-claude-guard-in-depth) |
 | ☠ | [`deadman`](components/deadman) | Remote locate / lock / scrub / wipe, phone-signed orders only; silent alert when the laptop goes online away from home |
-| ☁ | [`backup`](components/backup) | restic → Google Drive, encrypted, nightly; 12-phase `system-restore` rehearsed in a VM |
+| ☁ | [`backup`](components/backup) | restic → Google Drive, encrypted, nightly; 15-phase `system-restore`, rehearsed in a VM and used for real |
 | ⬆ | [`update`](components/update) | dnf + Flatpak, only after a successful backup; NVIDIA kernel module verified before any reboot |
 | 📸 | [`snapshots`](components/snapshots) | btrfs snapshots before/after every package transaction + hourly `/home` |
 | 🩺 | [`disk-health`](components/disk-health) | NVMe SMART, btrfs error counters, monthly scrub, free space |
@@ -225,13 +225,21 @@ the agent:
   secrecy doesn't matter for safety, because signatures do the authenticating.
 - **Actions:** `test` · `locate` (Wi-Fi geolocation + IP) · `lost` (location every 10 min) · `lock` (lock, end
   desktop sessions, disable password login) · `scrub` (delete credentials, log out of Tailscale) · `wipe`
-  (destroy LUKS keyslots: crypto-erase in seconds, then power off).
-- **Away-from-home alert:** every check also identifies the current network by its **router's MAC address** (a
-  Wi-Fi name is trivial to copy). On any network that isn't my trusted home router it sends a silent email: where
-  it is, who's logged in, and the exact phone commands to lock or wipe it. Alerts repeat on a new network, after
-  coming back from 30+ min offline, and every 4 h. Trusting a network or pausing alerts sends an email itself,
-  so a thief who does either tips me off.
-- Self-test: 11 signature/replay/expiry cases and 9 away-alert scenarios, run before every install.
+  (destroy LUKS keyslots: crypto-erase in seconds, then power off; the disk has been encrypted since the
+  2026-11-27 reinstall).
+- **Away-from-home alert:** with the disk encrypted, a stolen laptop that's off can't get online at all; one stolen
+  while awake can, and this is the only signal that it did. So "home" must be impossible to fake: it means the
+  **router's MAC address *and* home's public IP** at the same time. A thief can copy a router MAC (a Wi-Fi name is
+  even easier), but their network can't have my home's public IP. Blocking the IP lookup doesn't help either: if
+  the home router is seen but its public IP can't be confirmed for ~10 min, it counts as away. Anywhere that isn't
+  home gets a silent high-priority email: where it is, who's logged in, and the exact phone commands to lock or wipe
+  it. Alerts repeat on a new network, after coming back from 30+ min offline, and every 4 h. The cost of this design
+  is a false alarm at home when the ISP changes my IP, which is the safe direction to fail.
+- **Trusting home and pausing the alerts are phone-only signed orders** (`trust`, `away-pause 3d`). There is no
+  laptop command for either, so neither someone at the keyboard nor the AI agent can silence the alerts without
+  root (and the trust file is root-only, guard-blocked for the agent).
+- Self-test: 16 signature/replay/expiry/confirmation cases and 14 away-alert scenarios (including a copied router
+  MAC, blocked IP lookups and an ISP IP change), run before every install.
 
 ## Backup, update, recovery
 
@@ -240,9 +248,21 @@ the agent:
 - **NVIDIA-safe updates:** after a kernel update the proprietary module must build and load for the new kernel
   before a reboot is suggested; otherwise the old kernel stays the default.
 - **Three recovery speeds:** btrfs snapshot rollback (seconds) → restic restore from Drive (hours) →
-  `system-restore`, a 12-phase rebuild of a fresh install, rehearsed end-to-end in a VM (an afternoon).
-- The weekly full test suite performs **real restores** from Google Drive. A backup that hasn't been restored
-  isn't proven to work.
+  `system-restore`, a 15-phase rebuild of a fresh install (an afternoon). Rehearsed end-to-end in a VM first, then used
+  for real on 2026-11-27 to move the laptop onto a LUKS-encrypted disk.
+- A weekly root job performs **real restores** from Google Drive and compares them with the live files. A backup
+  that hasn't been restored isn't proven to work.
+- **The backups are out of reach of my user account**, and so of the AI agent. Every restic job runs as root, and the
+  backup password and Drive login live only in a root-only folder. Root never executes a file my user can edit:
+  settings are root-owned copies installed after review, and everything root writes into my home is written *as* my
+  user, so a planted symlink can't redirect a root write. My user can start a backup and read its results; opening
+  the repo (browse, restore) needs my sudo password. Before this, anything running as me could have read the Drive
+  login and deleted every backup.
+- **The backups live in a separate Google account** that is never signed in to a browser on the laptop. My
+  everyday browser session belongs to my personal account, which holds no backups and has no login on the laptop at
+  all. The backup account shares my 5 TB through Google One family (storage only, not files). Its recovery runs only
+  through my phone: no recovery email, no forwarding. The move was a server-side Drive-to-Drive copy, verified with
+  `restic check` and a real restore before the personal copy was deleted.
 
 ## watcher: one place to see everything
 

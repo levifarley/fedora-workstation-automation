@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily movie collection backup (when the SSD is plugged in)
+
+[Timer]
+OnCalendar=*-*-* 01:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

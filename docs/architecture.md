@@ -30,7 +30,7 @@ flowchart LR
     end
 
     SSD[("Samsung SSD<br/>movie collection")]
-    GD[("☁ Google Drive 5 TB<br/>encrypted restic repos")]
+    GD[("☁ Google Drive, system account<br/>encrypted restic repos")]
     GH[("GitHub<br/>private fedora-setup")]
     MAIL["📧 Gmail<br/>[system] alerts"]
     TS{{"Tailscale<br/>private network"}}
@@ -73,14 +73,15 @@ gantt
 | When | Job | What it does |
 |---|---|---|
 | 00:00 daily | **nightly** | 1. **backup**: encrypted restic snapshot of `/home` + `/etc` + package manifest → Google Drive<br/>2. **update**: dnf + Flatpak, only if the backup succeeded; NVIDIA module verified before any reboot<br/>3. **verify**: safe auto-fixes → quick tests → health check (always runs) |
-| 01:30 daily + on plug-in | **movies-backup** | Samsung SSD → its own encrypted restic repo on Drive |
+| 01:30 daily + on plug-in | **movies-backup** | Samsung SSD → its own encrypted restic repo on Drive (root, system unit) |
 | 12:00 daily | **disk-health** | NVMe SMART, btrfs errors, monthly scrub, free space, SSD health |
 | 23:30 daily | **dots** | commit + push config/script changes to GitHub |
 | hourly | **snapshots-hourly** | btrfs snapshot of `/home` (24 h · 7 d · 4 w kept) |
 | every dnf run | *(dnf hook)* | before/after btrfs snapshot of `/` |
 | every 2 min | **deadman** | check for phone-signed orders |
 | on SSD change | **movielist** | keep the movie list on the SSD current |
-| Sun 12:30 | **tests** | full end-to-end test suite (incl. real restores from Drive) |
+| Sun 12:00 | **backup-verify** | root: real restores from Drive (system + movies), compared with the live files → verify.json |
+| Sun 12:30 | **tests** | full end-to-end test suite (reads the restore results) |
 | Sun 13:00 | **report** | weekly summary email |
 
 ---
@@ -98,11 +99,11 @@ flowchart TB
         S4["configs → GitHub (dots)"]
     end
     subgraph L3["Layer 3: Rebuild (an afternoon)"]
-        S5["system-restore<br/>12-phase rebuild, rehearsed in a VM"]
+        S5["system-restore<br/>15-phase rebuild, rehearsed in a VM + used for real"]
     end
     subgraph L4["Layer 4: Lost or stolen"]
         S6["deadman: locate · lock · scrub · wipe<br/>phone-signed orders only"]
-        S7["disk encryption (LUKS)<br/>planned: weekend reinstall"]
+        S7["disk encryption (LUKS) ✔<br/>since the 2026-11-27 reinstall"]
     end
     L1 --> L2 --> L3
     L4
@@ -159,7 +160,7 @@ sequenceDiagram
 
 - **SSH:** keys only, `levi` only, no forwarding (so the phone's keys can never be used from the laptop), Tailscale only. Verified from `sshd -T`.
 - **deadman:** the laptop holds only the **public** key, so nothing on it, Claude included, can forge an order. Actions: `test` · `locate` · `lost`/`found` · `lock`/`unlock` · `scrub` · `wipe`.
-- **Away alert:** every 2-min check identifies the network by its router's MAC. On anything but the trusted home router it sends a high-priority email (location, who's logged in, the exact phone orders). `deadman trust-here` · `deadman away pause 3d`. Tested on a phone hotspot 2026-11-25.
+- **Away alert:** every 2-min check identifies the network. "Home" = the router's MAC **and** home's public IP together (a copied MAC on another network doesn't pass; a home router whose public IP can't be confirmed for ~10 min counts as away). On anything but home it sends a high-priority email (location, who's logged in, the exact phone orders). Trusting home and pausing alerts are **phone-only** signed orders (`trust` / `untrust` · `away-pause 3d` / `away-resume`), so nobody at the keyboard can silence it. Tested on a phone hotspot 2026-11-25.
 
 ---
 
@@ -187,9 +188,8 @@ sequenceDiagram
 | Showcase | `tools/sync.sh` | `~/Projects/fedora-workstation-automation` | public GitHub repo (redacted copy) | (none) |
 | DVD tools | `ripit` · `ripdvd` · `burnit` · `mkdvdiso` · `/ripit` · `/burnit` | (scripts) | `~/.local/bin` | (none) |
 | Terminal | `ll` · `cat` (bat) · `h` · `tailf` | `~/.bashrc.d/` | (shell) | (none) |
-| Claude usage | `claude-usage-today` | (script) | `~/.local/bin` | (none) |
 
-**Every watched job:** nightly · backup · update · verify · disk-health · movielist · movies-backup · snapshots-hourly · snapshots-cleanup · tests · report · dots · deadman
+**Every watched job:** nightly · backup · update · verify · disk-health · movielist · movies-backup · backup-verify · snapshots-hourly · snapshots-cleanup · tests · report · dots · deadman
 
 ---
 
@@ -200,7 +200,8 @@ sequenceDiagram
 | Home folder, `/etc`, package manifest | NVMe (btrfs) | hourly snapshots · nightly Drive (restic) |
 | Movie collection | Samsung SSD (exFAT) | Drive (restic, own repo) |
 | Configs + scripts | `~/.config`, `~/.local/bin` | GitHub (dots) · Drive · snapshots |
-| Secrets (backup password, Drive/GitHub logins, keys) | root/600 files, never in git | password manager (off-device) |
+| Backup credentials (restic password, Drive login) | **`/etc/backup`, root 700 only** (every restic job runs as root, since 2026-11-27) | password manager (off-device) |
+| Other secrets (GitHub login, SSH keys, alert app password) | 600 files, never in git, guard-blocked for Claude | password manager (off-device) |
 | Claude activity | system journal | (n/a) |
 | Docker images + volumes | `~/.local/share/docker` (rootless) | **not backed up**: images rebuild; export volumes to `~/docker-export` before a reinstall |
 
@@ -209,8 +210,8 @@ sequenceDiagram
 ## 8. Roadmap
 
 - [x] **Email alerts, option 2:** a separate alerts Gmail, sent over SMTP with curl (ntfy no longer forwards email anonymously)
-- [ ] **Encrypted reinstall** (weekend 2026-11-28/29) using `system-restore`
-- [ ] **deadman:** a real crypto-erase wipe once LUKS is in place; test the full chain
+- [x] **Encrypted reinstall** (2026-11-27) using `system-restore`: LUKS on, everything restored
+- [ ] **deadman:** re-pair the phone after the reinstall, then test the chain (wipe is now a real crypto-erase)
 - [ ] **Sandbox mode** for Claude Code (OS-level limits on top of the guard)
 - [ ] **Development framework / suite** *(future)*
 
@@ -222,3 +223,4 @@ sequenceDiagram
 |---|---|
 | 2026-11-24 | Terminal colors, Zed tweaks · restic → Google Drive backup · NVIDIA-safe nightly update · Flatpaks → RPMs · VS Code, Déjà Dup, Proton VPN removed · `watcher` overseer · btrfs snapshots · disk-health · test suite · pause · nightly verify + fixer · `watcher commands` · dots/GitHub · tight firewall zone · Claude guard |
 | 2026-11-25 | Movie backup to Drive (150 GiB) · `system-restore` + VM rehearsal (passed) · guard pause · phone access (Tailscale, `ssh system`, Claude in tmux) · `deadman` remote lock/locate/wipe · central email alerts · `/dots` · this document · deadman away-from-home alert (router-MAC trust) · guard notifies on serious blocks only · rootless Docker (closed a root-equivalent `docker` group) · alerts via a separate Gmail over SMTP · `system-restore` phases `deadman` + `docker` and a "Before wiping" checklist · public showcase repo |
+| 2026-11-27 | **Encrypted reinstall** (LUKS) and full restore with `system-restore` (15 phases incl. new `nvidia`, `deadman`, `docker`) · NVIDIA 620 built for every kernel before reboot · restore fixes (dconf locked keys, failed phases shown ✘, zstd version pin, kmod packages) · Bootstrap section in RESTORE.md · new `identity` phase: a reinstall keeps machine-id, SSH host keys, Tailscale node and deadman pairing, so the phone needs no changes · deadman-wipe test procedure · backups moved to a separate system Google account (server-side copy, verified), personal account holds no backups or laptop login |

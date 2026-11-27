@@ -42,8 +42,9 @@ put .config/deadman/phone/deadman-order         deadman/phone/deadman-order
 
 # --- backup + restore
 put .local/bin/backup                           backup/bin/backup
-for f in env excludes install.sh system-restore RESTORE.md; do put ".config/backup/$f" "backup/$f"; done
-for f in system-backup system-backup.service 50-system-backup.rules; do put ".config/backup/system/$f" "backup/system/$f"; done
+for f in env excludes install.sh system-restore RESTORE.md migrate-drive-account.sh; do put ".config/backup/$f" "backup/$f"; done
+for f in system-backup system-backup.service 50-system-backup.rules movies-backup.service movies-backup.timer \
+         backup-verify.service backup-verify.timer; do put ".config/backup/system/$f" "backup/system/$f"; done
 put .local/bin/rehearsal                        backup/bin/rehearsal
 
 # --- update (NVIDIA-safe nightly chain)
@@ -72,7 +73,6 @@ for f in dots-autosave.service dots-autosave.timer; do put ".config/systemd/user
 # --- shell hooks + Claude Code skills that drive the tools
 for f in backup-check.sh update-check.sh remote.sh colors.sh; do put ".bashrc.d/$f" "shell/bashrc.d/$f"; done
 for s in watcher backup update snapshots dots deadman; do put ".claude/skills/$s/SKILL.md" "claude-skills/$s/SKILL.md"; done
-put .claude/statusline-usage.sh                 claude-skills/statusline-usage.sh
 
 # --- the architecture document
 cp "$H/Documents/System-Architecture.md" "$REPO/docs/architecture.md"

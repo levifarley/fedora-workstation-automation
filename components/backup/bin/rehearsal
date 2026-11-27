@@ -100,13 +100,21 @@ case "${1:-help}" in
     secrets)
         [ -t 0 ] && [ -t 1 ] || { echo "Run this yourself in a terminal (it copies your Drive login + restic password into the VM)."; exit 1; }
         read -rp "Copy your Drive login and restic password into the rehearsal VM? [y/N] " a; [ "$a" = y ] || exit 0
-        SSH 'mkdir -p ~/.config/rclone ~/.config/backup && chmod 700 ~/.config/rclone ~/.config/backup'
-        SCP "$HOME/.config/rclone/rclone.conf" levi@127.0.0.1:.config/rclone/rclone.conf &&
-        SCP "$HOME/.config/backup/restic-password" levi@127.0.0.1:.config/backup/restic-password &&
-        SSH 'chmod 600 ~/.config/rclone/rclone.conf ~/.config/backup/restic-password' && echo "${G}✔ secrets copied — next: rehearsal run${N}" ;;
+        # the credentials are root-only on the laptop (/etc/backup) and go to the same root-only place in the VM;
+        # they travel through a temp dir that only exists for this command
+        t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+        if sudo test -s /etc/backup/restic-password; then
+            sudo install -m 600 -o "$USER" /etc/backup/rclone.conf /etc/backup/restic-password "$t/" || exit 1
+        else   # laptop not migrated yet (pre-2026-11-27 layout): take the old per-user copies
+            install -m 600 "$HOME/.config/rclone/rclone.conf" "$HOME/.config/backup/restic-password" "$t/" || exit 1
+        fi
+        SSH 'rm -rf ~/.creds-in && mkdir -m 700 ~/.creds-in' &&
+        SCP "$t/rclone.conf" "$t/restic-password" levi@127.0.0.1:.creds-in/ &&
+        SSH 'sudo install -d -m 700 -o root -g root /etc/backup && sudo install -m 600 -o root -g root ~/.creds-in/* /etc/backup/ &&
+             shred -u ~/.creds-in/* && rmdir ~/.creds-in' && echo "${G}✔ secrets copied into the VM's /etc/backup — next: rehearsal run${N}" ;;
     run)
         SSH 'mkdir -p ~/.local/bin' && SCP "$HOME/.config/backup/system-restore" levi@127.0.0.1:.local/bin/system-restore || exit 1
-        SSH 'chmod +x ~/.local/bin/system-restore; test -s ~/.config/backup/restic-password' || { echo "${Y}secrets not in the VM yet — run: rehearsal secrets${N}"; exit 1; }
+        SSH 'chmod +x ~/.local/bin/system-restore; sudo test -s /etc/backup/restic-password' || { echo "${Y}secrets not in the VM yet — run: rehearsal secrets${N}"; exit 1; }
         # run it as a transient systemd unit inside the VM: survives SSH disconnects, and "is it running?" is unambiguous
         SSH 'systemctl --user is-active -q rehearsal-restore ||
              systemd-run --user --unit=rehearsal-restore --collect --quiet \

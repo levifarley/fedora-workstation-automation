@@ -17,7 +17,7 @@ for s in dhcpv6-client mdns samba-client; do sudo firewall-cmd --permanent --zon
 for p in 57621/tcp 57621/udp; do sudo firewall-cmd --permanent --zone=laptop --add-port=$p >/dev/null; done
 sudo firewall-cmd --reload
 sudo firewall-cmd --set-default-zone=laptop
-echo; firewall-cmd --get-active-zones; echo; firewall-cmd --zone=laptop --list-all
+echo; sudo firewall-cmd --get-active-zones; echo; sudo firewall-cmd --zone=laptop --list-all
 echo
 echo "✔ Wi-Fi is now in the 'laptop' zone. Undo anytime: bash $0 --undo"
 "$HOME/.local/bin/watcher" test baseline

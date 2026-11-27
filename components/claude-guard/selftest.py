@@ -25,6 +25,13 @@ CASES = [
     (B("cat ~/.config/rclone/rclone.conf"), "deny"),
     (B("cat ~/.config/watcher/smtp-netrc"), "deny"),
     ({"tool_name": "Read", "tool_input": {"file_path": "/home/levi/.config/watcher/smtp-netrc"}}, "deny"),
+    (B("tar --zstd -xOf /var/lib/system-backup/etc.tar.zst etc/shadow"), "deny"),
+    (B("cat /var/tmp/restore-staging/etc-archive/etc/shadow"), "deny"),
+    (B("sudo cat /var/lib/tailscale/tailscaled.state"), "deny"),
+    (B("backup ls latest /var/lib/system-backup"), "log"),           # listing the snapshot is fine
+    (B("sudo cat /etc/backup/env"), "deny"),
+    (B("backup status"), "log"),
+    (B("ls -ld /var/tmp/restore-staging"), "log"),
     ({"tool_name": "Read", "tool_input": {"file_path": "/home/levi/.ssh/id_ed25519"}}, "deny"),
     (B("sudo rm /etc/claude-code/managed-settings.json"), "deny"),
     (B("cat /etc/claude-code/managed-settings.json 2>/dev/null"), "log"),
