@@ -42,7 +42,7 @@ put .config/deadman/phone/deadman-order         deadman/phone/deadman-order
 
 # --- backup + restore
 put .local/bin/backup                           backup/bin/backup
-for f in env excludes install.sh system-restore RESTORE.md migrate-drive-account.sh; do put ".config/backup/$f" "backup/$f"; done
+for f in env excludes install.sh system-restore RESTORE.md migrate-drive-account.sh bootstrap.sh CHANGELOG.md; do put ".config/backup/$f" "backup/$f"; done
 for f in system-backup system-backup.service 50-system-backup.rules movies-backup.service movies-backup.timer \
          backup-verify.service backup-verify.timer; do put ".config/backup/system/$f" "backup/system/$f"; done
 put .local/bin/rehearsal                        backup/bin/rehearsal

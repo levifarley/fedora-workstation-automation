@@ -309,7 +309,9 @@ def act_unlock():
 
 SCRUB = [".config/backup/restic-password", ".config/rclone", ".config/gh", ".ssh/id_ed25519", ".ssh/id_rsa", ".ssh/id_ecdsa",
          ".config/google-chrome", ".mozilla", ".claude/.credentials.json", ".local/share/keyrings", ".config/watcher/healthchecks-url",
-         ".dotfiles/config", "Documents/keys", ".config/watcher/smtp-netrc"]
+         ".dotfiles/config", "Documents/keys"]
+# NOT scrubbed on purpose: the alert-mail login (~/.config/watcher, the throwaway system account's send-only app
+# password). After a scrub the laptop must still email lost-mode locations and the wipe confirmation.
 # outside the home folder: the root-only backup credentials (since 2026-11-27) and the Tailscale node key
 SCRUB_ABS = ["/etc/backup/rclone.conf", "/etc/backup/restic-password", "/var/cache/restic", "/var/lib/system-backup"]
 

@@ -116,9 +116,12 @@ run_backup() {
         restic check --read-data-subset=5% || log "WARNING: restic check reported problems"
     fi
 
-    # plain-text restore guide next to the encrypted repo (readable without the password); read AS levi
-    local guide; guide=$(mktemp); as_user cat "$UH/.config/backup/RESTORE.md" >"$guide" &&
-        rclone copyto "$guide" "${RCLONE_REMOTE_DIR}/RESTORE.md"; rm -f "$guide"
+    # plain-text restore guide + bootstrap script next to the encrypted repo (readable without the password); read AS levi
+    local guide f; guide=$(mktemp)
+    for f in RESTORE.md bootstrap.sh; do
+        as_user cat "$UH/.config/backup/$f" >"$guide" 2>/dev/null && rclone copyto "$guide" "${RCLONE_REMOTE_DIR}/$f"
+    done
+    rm -f "$guide"
 
     local info
     info=$(restic snapshots latest --json --no-lock 2>/dev/null | jq -r '.[0] | "snapshot \(.short_id) · +\((.summary.data_added // 0) / 1048576 | floor) MiB new · \((.summary.total_files_processed // 0)) files"' 2>/dev/null)

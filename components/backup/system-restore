@@ -26,11 +26,12 @@ STAGE=/var/tmp/restore-staging
 DONE="$HOME/.local/state/system-restore"; mkdir -p "$DONE"
 LOG="$HOME/system-restore.log"
 CRED=/etc/backup
-# restic as root with the root-only credentials (same settings as the nightly job)
+# restic as root with the root-only credentials. Restores only READ, so they use twice the nightly job's gentle
+# Drive rate limit (8): the 12 GB download took 46 of the 59.5 min on 2026-11-27 at 8 (baseline in the post-mortem).
 restic() { sudo env RCLONE_CONFIG="$CRED/rclone.conf" RESTIC_PASSWORD_FILE="$CRED/restic-password" \
                RESTIC_REPOSITORY="rclone:gdrive:fedora-backup/restic" RESTIC_CACHE_DIR=/var/cache/restic \
-               RCLONE_DRIVE_USE_TRASH=false RCLONE_TPSLIMIT=8 RCLONE_TPSLIMIT_BURST=8 RCLONE_LOW_LEVEL_RETRIES=20 \
-               restic "$@"; }
+               RCLONE_DRIVE_USE_TRASH=false RCLONE_TPSLIMIT=16 RCLONE_TPSLIMIT_BURST=16 RCLONE_LOW_LEVEL_RETRIES=20 \
+               restic -o rclone.connections=8 "$@"; }
 B=$'\e[1m'; G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; N=$'\e[0m'
 say()  { echo "${B}[$(date +%H:%M:%S)] $*${N}" | tee -a "$LOG"; }
 note() { echo "${Y}  ! $*${N}" | tee -a "$LOG"; echo "$*" >>"$DONE/notes.txt"; }

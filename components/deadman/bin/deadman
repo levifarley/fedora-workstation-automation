@@ -35,7 +35,9 @@ PY
         else echo "${Y}agent installed, hasn't run yet${N}"; fi
         systemctl is-active -q deadman-agent.timer && echo "${D}  timer: every 2 min · orders log: deadman log${N}" ;;
     where)   python3 -I "$AGENT" --locate ;;
-    log)     journalctl -t deadman --since -30d --no-pager -o short-iso | tail -30 ;;
+    # --merge: right after a restore, phase identity has put back the old machine-id, so until the next reboot new
+    # entries land in a journal folder named after a different id; without --merge `deadman log` looks empty
+    log)     journalctl --merge -t deadman --since -30d --no-pager -o short-iso | tail -30 ;;
     trust-here|trust|untrust)
         echo "${Y}Phone only${N}, so nobody at this keyboard can silence the away alerts. With the laptop on the network,"
         echo "send from the phone:  ${B}~/bin/deadman-order trust${N}   (or: untrust)" ; exit 2 ;;

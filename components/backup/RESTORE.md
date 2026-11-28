@@ -1,204 +1,127 @@
-# System restore guide (for Claude Code on a fresh Fedora install)
+# System restore guide (for Levi, and for Claude Code on a fresh Fedora install)
 
-This file lives in Google Drive at `fedora-backup/RESTORE.md` (plain text) and inside every
-backup snapshot at `~/.local/share/system-manifest/RESTORE.md`.
+This file lives in Google Drive at `fedora-backup/RESTORE.md` (plain text, next to `bootstrap.sh`) and inside every
+backup snapshot at `~/.local/share/system-manifest/RESTORE.md`. History and lessons: `CHANGELOG.md` (same folder).
 
-**Machine:** ThinkPad, Fedora (see `system-info.txt`), user `levi`, hostname `fedora`.
-**Backup:** restic repository at `gdrive:fedora-backup/restic` (Google Drive via rclone),
-encrypted with a password that Levi keeps in a password manager. **Ask Levi for it.**
-Nightly snapshots: 7 daily, 4 weekly, 12 monthly.
+**Machine:** ThinkPad P1, Fedora 45, user `levi`, hostname `fedora`, disk encrypted (LUKS).
+**Backup:** restic repository `gdrive:fedora-backup/restic` (`/movies` is the movie repo) in the **system** Google
+account (not the personal one). Encrypted with a password Levi keeps in a password manager. **Ask Levi for it.**
+Credentials live **only** in `/etc/backup` (root 700); every restic job runs as root. Snapshots: 7 daily, 4 weekly, 12 monthly.
+**Baseline:** a full restore took 59.5 min on 2026-11-27 (46 min of it the 12 GB download, before the rate limit was raised).
 
 ## What's in each snapshot
-- `/home/levi`: the full home folder, *minus* caches, trash, Flatpak runtimes, `node_modules`,
-  Claude Code binaries, and Zed's downloaded language servers (these are all reinstallable).
-- `/var/lib/system-backup/`:
-  - `etc.tar.zst`: the whole `/etc` (with SELinux labels/xattrs)
-  - `usr-local.tar.zst`: `/usr/local` (includes `/usr/local/bin/system-backup`)
-  - `rpm-modified-files.txt`: package files Levi changed from their RPM defaults (**the /etc files that matter**)
-  - `system-services-enabled.txt`, `kernel-cmdline.txt`, `disks.txt`, `docker-images.txt`
-- `~/.local/share/system-manifest/`: `dnf-userinstalled.txt`, `dnf-repos-enabled.txt`, `dnf-copr.txt`,
-  `flatpak-remotes.txt`, `flatpak-apps.txt`, `user-services-enabled.txt`, `dconf-full.ini` (GNOME settings),
-  `zed-extensions.txt`, `nvm-node-versions.txt`, `npm-global.txt`, `pip-user.txt`, `crontab.txt`
+- `/home/levi`, minus caches, trash, Flatpak runtimes, `node_modules`, Claude Code binaries, Zed's downloads and
+  `~/.local/share/docker` (export Docker volumes to `~/docker-export` before a wipe).
+- `/var/lib/system-backup/`: `etc.tar.zst` (all of `/etc`), `usr-local.tar.zst`, `tailscale.tar.zst` (the Tailscale node),
+  `rpm-modified-files.txt`, `system-services-enabled.txt`, `kernel-cmdline.txt`, `disks.txt`, `docker-images.txt`.
+- `~/.local/share/system-manifest/`: package, repo, COPR, Flatpak, service, GNOME (`dconf-full.ini`), Zed, node, npm, pip lists.
 
-## Other copies
-- **Movies (Samsung SSD):** separate restic repo `rclone:gdrive:fedora-backup/movies` (same password). Restore to a new drive:
-  `RESTIC_REPOSITORY=rclone:gdrive:fedora-backup/movies restic restore latest --target /run/media/levi/<new drive>`
-  (files restore under their original path inside the target).
-- **Configs + scripts in git:** bare repo `~/.dotfiles` (inside the home backup). If Levi pushed it to a private GitHub repo,
-  `git clone --bare <url> ~/.dotfiles && git --git-dir=$HOME/.dotfiles --work-tree=$HOME checkout` restores the setup
-  without restic. Secrets are NOT in git: the restic password comes from Levi; the ntfy topic and rclone login come from the restic backup or get re-created.
-
-## Bootstrap: fresh install → Claude Code (do this yourself, before Claude exists on the machine)
-Copy-paste in order, in a real terminal. Exact paths matter: the Drive folder is `fedora-backup` (**singular**)
-and the repo is the `restic` **subfolder** inside it (`fedora-backup/movies` is the movies repo).
+## 1. Bootstrap: fresh install → Claude Code (Levi does this; Claude doesn't exist yet)
+In a terminal **inside GNOME**:
 ```bash
-# 1. tools + root-only credentials folder (the backups only ever read credentials from here)
-sudo dnf install -y restic rclone
-sudo install -d -m 700 -o root -g root /etc/backup /var/cache/restic
-# 2. Drive login: made in a temp file, moved into /etc/backup, temp shredded (browser login; client ID/secret: step 2 below)
-#    Sign in as the SYSTEM Google account (the backups live there since the 2026-11-27 migration), in a PRIVATE
-#    window, then close every private window: that account must never stay signed in to a browser on this laptop.
-t=$(mktemp); RCLONE_CONFIG=$t rclone config create gdrive drive scope=drive client_id <ID> client_secret <SECRET> --auth-no-open-browser
-#    (it prints a link: open it in the private window)
-sudo install -m 600 -o root -g root $t /etc/backup/rclone.conf && shred -u $t
-# 3. backup password: paste it, Enter, Ctrl-D (typed straight into the root-only file)
-sudo sh -c 'umask 077; cat > /etc/backup/restic-password'
-# 4. check + restore just the guard and the backup tools (as root, with the root-only credentials)
+curl -fsSLO https://raw.githubusercontent.com/levifarley/fedora-workstation-automation/main/components/backup/bootstrap.sh
+bash bootstrap.sh
+```
+It asks for the OAuth client ID + secret, the **system** account login (a link; a throwaway Firefox profile is the
+default, deleted afterwards), and the backup password. It checks each one, restores the guard + backup tools,
+installs the guard **first**, then Claude Code. If it stops, fix what it says and run it again: it resumes.
+Then: open a new terminal, `cd ~ && claude`, and say *Read ~/.config/backup/RESTORE.md, then help me run system-restore.*
+
+<details><summary>Manual fallback (only if bootstrap.sh can't be downloaded or fails)</summary>
+
+Type the values when asked; nothing to replace in the commands.
+```bash
+sudo dnf install -y restic rclone jq && sudo install -d -m 700 /etc/backup /var/cache/restic
+read -rp 'client ID: ' CID; read -rsp 'client secret: ' CSEC; echo
+rclone authorize drive "$CID" "$CSEC" --auth-no-open-browser     # open the printed link, sign in as the SYSTEM account
+read -rp 'paste the {"access_token"...} line it printed: ' TOK
+sudo rclone --config /etc/backup/rclone.conf config create gdrive drive scope=drive client_id "$CID" client_secret "$CSEC" token "$TOK"
+unset CSEC TOK; sudo rclone --config /etc/backup/rclone.conf lsd gdrive:fedora-backup          # lists: restic, movies
+read -rsp 'backup password: ' P; echo; printf '%s' "$P" | sudo sh -c 'umask 077; cat > /etc/backup/restic-password'; unset P
 R() { sudo env RCLONE_CONFIG=/etc/backup/rclone.conf RESTIC_PASSWORD_FILE=/etc/backup/restic-password \
       RESTIC_REPOSITORY=rclone:gdrive:fedora-backup/restic RESTIC_CACHE_DIR=/var/cache/restic restic "$@"; }
-sudo env RCLONE_CONFIG=/etc/backup/rclone.conf rclone lsd gdrive:fedora-backup   # should list: restic, movies
-R snapshots                                     # newest = the "Before wiping" backup from the same day
+R snapshots --latest 1
 R restore latest --target / --include /home/levi/.config/claude-guard --include /home/levi/.config/backup --include /home/levi/.local/bin
-bash ~/.config/claude-guard/install.sh          # guard FIRST, before Claude Code ever runs
-curl -fsSL https://claude.ai/install.sh | bash  # then open a new terminal
-cd ~ && claude
+bash ~/.config/claude-guard/install.sh && curl -fsSL https://claude.ai/install.sh | bash
 ```
-Then tell Claude: *Read ~/.config/backup/RESTORE.md, then help me run system-restore.*
-"repository does not exist / config file does not exist" means the path is wrong (usually a missing `/restic`).
+Afterwards sign the system account out of that browser. "repository does not exist" = wrong path (missing `/restic`)
+or wrong Google account (the backups are in the **system** account).
+</details>
 
-## Fast path: the restore script
-After the bootstrap, run the script yourself in a real terminal (it asks for sudo many times; Claude can't type it):
-`~/.config/backup/system-restore`. It automates steps 4–13, skips phases that are already done, and never overwrites
-/etc. Instead it writes `~/restore-etc-review.txt` for Levi to go through.
-`system-restore --list` shows progress. If a phase fails, fix it and re-run. The manual steps below are the reference.
-**Run it from a terminal inside GNOME** (not over SSH), so the `dconf` phase can load the GNOME settings.
-**Don't reboot until the `nvidia` phase has passed**, or the first boot has no graphics driver.
+## 2. The restore script
+Levi runs it in a terminal **inside GNOME** (sudo prompts; `dconf` needs the desktop): `~/.config/backup/system-restore`.
+`--list` shows progress; a failed phase can be fixed and re-run (finished phases are skipped). It never overwrites
+`/etc` blindly: it writes `~/restore-etc-review.txt`. **Don't reboot until the `nvidia` phase has passed.**
 
-**Real run 2026-11-27** (the encrypted reinstall): fixed afterwards, so next time these are automatic:
-- `dconf load` refuses the whole file if any key is locked by the system (authselect locks 3 `login-screen` keys).
-  The script now drops locked keys first. Before, it printed "non-writable keys", loaded **nothing**, and still said ✔.
-- akmod-nvidia was installed, but no module got built (akmods only runs at boot). Now phase `nvidia` builds it for every kernel.
-- dnf upgraded `libzstd` without the `zstd` binary, so `tar --zstd` broke ("incorrect library version") and `usrlocal`
-  failed silently. The script now upgrades the pair and fails the phase on error.
-- `kmod-nvidia-<kernel>` packages were listed as "installed by hand". They're built locally and are now left out of the manifest.
-- `systemd-vconsole-setup.service` failed on first boot ("Failed to check /dev/tty1 has font support"). That's a harmless
-  boot-time race with the GPU framebuffer: `sudo systemctl restart systemd-vconsole-setup` clears it for `watcher check`.
+What needs Levi during or after it:
+1. **Phase `identity` asks yes/no.** It shows the deadman phone key's fingerprint: it must match
+   `ssh-keygen -lf ~/.ssh/deadman_ed25519.pub` on the phone (`SHA256:cfPX7r/7…`). Type `yes`. This brings back the
+   machine-id, SSH host keys, Tailscale node, deadman pairing and hostname, so **the phone needs no changes.**
+2. **Phone access:** `~/.config/remote/install.sh` (SSH hardening, Tailscale-only firewall, then sshd on). With the node
+   restored it needs no login. **It must print `name: system`.** Anything else: see "If the identity didn't come back".
+3. **Prove deadman** from the phone: `~/bin/deadman-order test` → email "test OK", `deadman log` shows ACCEPTED.
+   Expect one **"REJECTED: stale order" email per order still on the channel** (5 after the stolen-laptop test). That's
+   the replay protection working. Until the first reboot, journal tools need `--merge` (`deadman log` does it).
+4. **Reboot**, then `nvidia-smi` and `watcher check`.
+5. Go through `~/restore-etc-review.txt`, then `sudo rm -rf /var/tmp/restore-staging` (a user-readable copy of the old
+   `/etc`: password hashes, host keys, Wi-Fi passwords). The watcher test fails if it's still there after 3 days.
+6. Docker projects: `cd ~/Projects/<project> && docker compose up -d --build`, then `rm -rf ~/docker-export`.
+   Docker is rootless; never add levi to the `docker` group (that's passwordless root).
+7. Hand-installed apps aren't in any repo: Postman (`/opt/Postman`, from https://dl.pstmn.io/download/latest/linux_64,
+   chown to levi), elementary-screenshot.
+8. `backup` then `backup verify`, then `watcher test --full`.
 
-**Rehearsed 2026-11-25 in a VM** (`rehearsal`), then used for real 2026-11-27 (now 16 phases). 25 tests passed; the only failures were VM-specific (SSH on).
-Expect these manual follow-ups (the script lists them in its notes):
-- **Claude Code** itself isn't in the backup: `curl -fsSL https://claude.ai/install.sh | bash`. Install the Claude guard
-  (`~/.config/claude-guard/install.sh`) **before** using Claude Code for anything else.
-- Apps installed by hand from a download (not in any repo), e.g. elementary-screenshot: reinstall if still wanted.
-- GNOME settings: loaded by phase `dconf` when run inside the desktop. Otherwise run `system-restore --phase dconf` from GNOME
-  (not a raw `dconf load` of the manifest: that fails on system-locked keys), then log out/in.
-- Go through `~/restore-etc-review.txt` (Wi-Fi, custom /etc changes) with Levi.
-- NVIDIA: the packages come back in phase `packages`, and phase `nvidia` builds the module (`sudo akmods --force --kernels <k>`)
-  for every installed kernel (installing a missing `kernel-devel-<k>` itself; the installer's own kernel ships without one).
-  Only the newest kernel, which is the default boot, must succeed. Reboot only after it passes, then check `nvidia-smi`.
-- **The laptop keeps its identity** (phase `identity`, real runs only, never in a rehearsal): machine-id, SSH host keys,
-  the Tailscale node (`/var/lib/tailscale`, backed up since 2026-11-27) and the deadman pairing (`/etc/deadman`: phone key,
-  order channel, trusted home router, nonce history), plus the hostname deadman orders are signed for. It shows the
-  phone key's fingerprint and asks **yes** before trusting it again. Check it against `ssh-keygen -lf ~/.ssh/deadman_ed25519.pub`
-  on the phone. **Result: the phone needs no changes at all.** Same `ssh system`, no host-key warning, `deadman-order` just works.
-- **Phone access (SSH over Tailscale) stays OFF** until `~/.config/remote/install.sh` is run in a real terminal. With the
-  node restored it needs no Tailscale login. It applies the SSH hardening and the Tailscale-only firewall zone, then enables
-  sshd. **It must print `name: system`.** Anything else (e.g. `system-1`) means a new device was created; it then prints the fix.
-- **Prove deadman:** on the phone `~/bin/deadman-order test` → `deadman log` shows ACCEPTED. One "REJECTED: stale order"
-  email right after a restore is normal (the order channel still holds the last order, e.g. the wipe; it's >15 min old).
-- **If the identity couldn't be restored** (backup older than 2026-11-27, or you answered no), it's the long way, learned the
-  hard way on 2026-11-27:
-  1. login.tailscale.com/admin/machines: **remove the old `system`**, rename the new `system-1` → `system`.
-  2. Phone: the ssh config pins the IP (`HostName 100.x.y.z` under `Host system`). Put the new IP there:
-     `sed -i 's/<old ip>/<new ip>/g' ~/.ssh/config`, then `ssh system hostname` (answer yes to the new host key; if it
-     says "HOST IDENTIFICATION HAS CHANGED", `ssh-keygen -R <new ip>` first). `ssh system true` prints nothing when it works.
-  3. Laptop: `deadman phone-setup`. Phone: `scp system:.deadman-phone.conf ~/.config/deadman/phone.conf && scp system:.config/deadman/phone/deadman-order ~/bin/`
-  4. Phone: `cat ~/.ssh/deadman_ed25519.pub` (the existing key; don't make a new one). Laptop: `deadman arm '<that line>'`.
-  5. Phone: `~/bin/deadman-order test` → ACCEPTED. Then, with the laptop at home, phone: `~/bin/deadman-order trust`
-     (trusting home is phone-only, so nobody at the keyboard can silence the away alerts).
-- **Delete the restore staging** once `~/restore-etc-review.txt` is done: `sudo rm -rf /var/tmp/restore-staging`. It's a
-  user-readable copy of the old /etc (password hashes, host keys, Wi-Fi passwords, deadman channel).
-- **Docker is rootless** (phase `docker`). Never add levi to the `docker` group: that's passwordless root. Volumes from
-  `~/docker-export` are restored automatically; images come back with `docker compose up -d --build` per project.
+### If the identity didn't come back
+(backup older than 2026-11-27, or `identity` answered no)
+1. login.tailscale.com/admin/machines: remove the old `system`, rename the new `system-1` → `system`.
+2. Phone: `~/.ssh/config` pins the IP (`HostName 100.x.y.z` under `Host system`): `sed -i 's/<old ip>/<new ip>/g' ~/.ssh/config`,
+   then `ssh system hostname` (yes to the new host key; on "HOST IDENTIFICATION HAS CHANGED": `ssh-keygen -R <ip>` first).
+   `ssh system true` prints nothing when it works.
+3. Laptop: `deadman phone-setup`. Phone: `scp system:.deadman-phone.conf ~/.config/deadman/phone.conf && scp system:.config/deadman/phone/deadman-order ~/bin/`
+4. Phone: `cat ~/.ssh/deadman_ed25519.pub` (the existing key). Laptop: `deadman arm '<that line>'`.
+5. Phone: `~/bin/deadman-order test` → ACCEPTED; at home: `~/bin/deadman-order trust` (phone-only by design).
 
-## Before wiping (the day of the reinstall)
+## 3. Before wiping
 Claude runs a full systems check and gives the go-ahead first. Then:
-1. **Export Docker volumes** (`~/.local/share/docker` is excluded from the backup, so they'd be lost):
-   ```bash
-   mkdir -p ~/docker-export && for v in $(docker volume ls -q); do
-     docker run --rm -v "$v":/v -v ~/docker-export:/out alpine tar -C /v -cf "/out/$v.tar" .; done; ls -lh ~/docker-export
-   ```
-2. **Fresh backups:** `backup` (runs one now), plus the movies backup if the SSD changed; then `backup status` shows today.
-3. **Config history pushed:** `dots save`.
-4. **Off the laptop** (password manager / paper): restic password, Google OAuth client ID + secret, GitHub login,
-   Wi-Fi password, Tailscale login, alerts Gmail app password, **the new LUKS passphrase you'll type in the installer**.
-   The phone keeps its deadman key; nothing to do there.
-5. Phone: `deadman-order test` still works (proves the phone side is fine before wiping), and `deadman` shows
-   **✔ network home** (trusted from the phone with `deadman-order trust`: router + public IP).
-6. **The backup must contain the identity:** `backup ls latest /var/lib/system-backup`
-   lists `etc.tar.zst` and `tailscale.tar.zst`.
-7. **The backups are root-only:** `watcher test backup` passes `credentials-root-only`, and `backup verify` passes
-   (a real restore from Drive, by root).
-8. **The identity restore works on this backup:** in the rehearsal VM, `system-restore --phase stage` then
-   `system-restore --phase identity --dry-run` reports **5/5**, with this laptop's machine-id and the trusted router.
+1. **Export Docker volumes:**
+   `mkdir -p ~/docker-export && for v in $(docker volume ls -q); do docker run --rm -v "$v":/v -v ~/docker-export:/out alpine tar -C /v -cf "/out/$v.tar" .; done`
+2. **Final backup:** `backup`, then `backup verify` (all ✔). Movies too if the SSD changed (`movies-backup`).
+3. `dots save`, and push the showcase repo (that's where `bootstrap.sh` is downloaded from).
+4. **Off the laptop** (password manager / paper): backup password, OAuth client ID + **current** secret, the **system**
+   account's password (2-step on the phone), GitHub, Wi-Fi, Tailscale logins, **the new LUKS passphrase**.
+5. **The OAuth app is "In production"** (Google Cloud Console → OAuth consent screen). In "Testing", Google expires the
+   login after 7 days and the nightly backup silently loses Drive.
+6. Phone: `deadman-order test` works, and `deadman` shows **✔ network home**.
+7. The backup carries the identity: in the rehearsal VM, `system-restore --rehearsal --phase stage`, then
+   `system-restore --phase identity --dry-run` → **5/5**, this laptop's machine-id, 1 trusted router.
+   (The VM needs current credentials first: `rehearsal secrets`.)
 
-### The stolen-laptop test (the whole remote chain, then the wipe)
-Play it exactly like a theft, no shortcuts: only the phone acts, nothing is typed on the laptop after step 1.
-Every step must produce its email. If one doesn't, **stop**: that's the bug to fix before trusting it in an emergency.
-1. Do **all** of the checklist above first (after the wipe, nothing on this disk can be recovered). Then lock the screen
-   and leave the laptop awake, like a stolen laptop that's still running.
-2. **"Stolen":** move the laptop off home: connect it to the phone's hotspot. Within ~2 min: email **"LAPTOP ONLINE
-   AWAY FROM HOME"** (where it is, who's logged in, the phone orders). This proves the alert fires off-home.
-3. Phone: `~/bin/deadman-order lost` → email "LOST MODE on", then a location email every 10 min.
-4. Phone: `~/bin/deadman-order lock` → email "locked". Check the laptop: desktop session ended, and your password
-   is refused at the login screen (that's the point).
-5. Phone: `~/bin/deadman-order unlock` → email "unlocked"; your password works again. (Proves lock is reversible.)
-   Lock again from the phone before the next step, like you would in a real theft.
-6. Phone: `~/bin/deadman-order wipe` → type the confirmation phrase it shows → passphrase for the deadman key.
-   Within ~2 min: email **"deadman: WIPE executing"** (it names the LUKS device), then the laptop powers off by itself.
-7. Power on: the LUKS prompt appears, but **your passphrase is rejected** ("No key available with this passphrase").
-   That's the proof: the keyslots are destroyed and the data is gone. Nothing to fix; boot the USB installer.
-8. Reinstall from the USB (encrypt the disk, user `levi`, hostname `fedora`), then Bootstrap → Fast path below.
-   After the restore, from the phone at home: `~/bin/deadman-order test`, then `~/bin/deadman-order trust`.
-(`scrub` isn't part of the test: wipe already destroys everything, and scrub is the fallback for an unencrypted disk.)
+### The stolen-laptop test
+Only the phone acts after step 1. Every step must produce its email; if one doesn't, **stop** and fix that first.
+1. Checklist above done. Lock the screen, leave the laptop awake.
+2. Connect it to the phone's hotspot → **"LAPTOP ONLINE AWAY FROM HOME"** within ~2 min.
+3. `~/bin/deadman-order lost` → "LOST MODE on", then a location email every 10 min.
+4. `~/bin/deadman-order lock` → "locked"; the password is refused at the login screen.
+5. `~/bin/deadman-order unlock` → "unlocked" (proves it's reversible); then `lock` again.
+6. `~/bin/deadman-order wipe` → type the phrase, then the deadman key passphrase → **"deadman: WIPE executing"**, power off.
+7. Power on. Either the LUKS prompt **rejects your passphrase**, or (as on 2026-11-27) the boot stops earlier at
+   **"root account is locked"** (emergency mode, no prompt at all). **Both mean the wipe worked:** the keyslots are gone.
+8. Boot the USB installer: encrypt the disk, user `levi`, hostname `fedora`. Then section 1.
+(`scrub` isn't part of the test: it logs Tailscale out, which would spoil the identity restore; wipe covers it anyway.)
 
-## Restore procedure
-Work step by step and confirm with Levi before overwriting anything in `/etc`.
-`sudo` needs a real terminal: give Levi the commands to paste.
-
-1. **Tools:** `sudo dnf install -y restic rclone`
-2. **Google Drive auth:** use Levi's own OAuth client, not rclone's shared one (that's retired). Get the client ID and
-   secret from Google Cloud Console → APIs & Services → Credentials ("Desktop app" client), or from Levi's
-   password manager, then run:
-   `rclone config create gdrive drive scope=drive client_id <ID> client_secret <SECRET>` (opens a browser login;
-   on the "unverified app" warning, click Advanced → continue). Do it into a temp file and move it into
-   `/etc/backup/rclone.conf` exactly as in **Bootstrap**. The credentials live **only** in `/etc/backup` (root 700).
-3. **Point restic at the repo:** use the `R` wrapper from Bootstrap (root + `/etc/backup`), then `R snapshots`.
-   Never put the password or the Drive login in `~`: anything running as levi, Claude included, could read it there.
-4. **Pull the latest snapshot into a staging dir** (don't restore straight over `/home` yet):
-   `R restore latest --target /var/tmp/restore-staging`
-5. **Repositories first:** look in `dnf-repos-enabled.txt` and `dnf-copr.txt`. Re-enable RPM Fusion
-   (free + nonfree), the COPRs (e.g. `che/zed`), Docker CE, negativo17 Spotify, and hardware:razer.
-   The repo files are also in `etc.tar.zst` under `etc/yum.repos.d/`.
-6. **Packages:** `sudo dnf install $(cat dnf-userinstalled.txt)`. Skip names that no longer exist and report them.
-   NVIDIA: see the notes in Claude's memory or `rpm-modified-files.txt`; install akmod-nvidia from RPM Fusion.
-7. **Apps (Levi dislikes Flatpak/Snap: prefer RPMs):** Google Chrome (`google-chrome` repo, `google-chrome-stable`),
-   GIMP, Transmission
-   (`transmission-gtk`), `gnome-extensions-app` and `gnome-browser-connector` are native RPMs and come back via step 6. Postman lives in
-   `/opt/Postman` (not in the backup): re-download https://dl.pstmn.io/download/latest/linux_64, extract it to /opt, and chown it to levi.
-   `~/.local/share/applications/postman.desktop` is restored with home. The **only** Flatpak is MakeMKV (user install, used by
-   ripdvd/ripit): `flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo &&
-   flatpak install --user -y flathub com.makemkv.MakeMKV`. Don't add system Flatpak remotes.
-8. **Home folder:** `rsync -aHAX ~/restore-staging/home/levi/ ~/`. Back up anything that's already in the
-   fresh home first. Then load GNOME settings with `system-restore --phase dconf` (it skips system-locked keys) and log out/in.
-9. **/etc:** extract `etc.tar.zst` to a temp dir. For each file in `rpm-modified-files.txt`, plus custom
-   additions (`/etc/systemd/system/*`, `/etc/polkit-1/rules.d/*`, `/etc/NetworkManager/system-connections/*`,
-   `/etc/yum.repos.d/*`), **diff against the fresh file and show Levi before copying.** Don't blindly
-   restore `fstab`, `crypttab`, `default/grub`, or `machine-id`, because disk UUIDs will differ.
-   Afterwards, run `sudo restorecon -Rv /etc`.
-9a. **Claude guard (install BEFORE using Claude Code for the rest of the restore, if Levi agrees):**
-    `~/.config/claude-guard/install.sh` puts the root-owned audit/guard hook in /etc/claude-code. Claude must not skip or weaken it.
-9b. **Firewall:** Levi uses a tight custom zone, not Fedora's default: run `bash ~/.config/watcher/firewall-laptop-zone.sh`
-    (it allows only DHCPv6, mDNS, samba-client and Spotify 57621 inbound).
-10. **Services:** re-enable the units from `system-services-enabled.txt` / `user-services-enabled.txt` that
-    aren't Fedora defaults.
-11. **Dev tooling:** install the nvm Node versions listed, then `npm i -g` the packages from `npm-global.txt`,
-    and pull the `docker-images.txt` images if needed.
-12. **Zed (the main editor; Levi does not use VS Code, so don't install it):**
-    `sudo dnf copr enable che/zed && sudo dnf install zed`. Settings, keymap and themes come back with the
-    home restore (`~/.config/zed/`), along with installed extensions, workspace history, agent threads and prompts
-    (`~/.local/share/zed/`). Zed re-downloads its language servers on first launch.
-13. **Re-arm backups:** extract `usr-local.tar.zst` (for `/usr/local/bin/system-backup`), then run
-    `~/.config/backup/install.sh` and then `~/.config/update/install.sh` in a real terminal (the second
-    schedules the midnight backup → update chain and installs `/usr/local/bin/system-update`), then
-    `~/.config/snapshots/install.sh` (btrfs snapshots), then `~/.config/watcher/install.sh` (failure notifications,
-    disk-health, `watcher run` permissions). Then run `watcher test --full`; everything should pass. Check everything with `watcher check`. Afterwards, run `backup status` to confirm the old repo is visible.
+## 4. Manual reference (what system-restore automates)
+Confirm with Levi before overwriting anything in `/etc`. `sudo` needs a real terminal: give Levi the commands.
+1. Stage: `R restore latest --target /var/tmp/restore-staging` (R from the manual fallback above).
+2. Repos first (`dnf-repos-enabled.txt`, `dnf-copr.txt`): RPM Fusion free + nonfree, COPRs (`che/zed`), Docker CE,
+   negativo17 Spotify, hardware:razer. Repo files are in `etc.tar.zst` under `etc/yum.repos.d/`.
+3. Packages: `sudo dnf install $(cat dnf-userinstalled.txt)` (report names that no longer exist). NVIDIA: akmod-nvidia
+   from RPM Fusion, then `sudo akmods --force --kernels <k>` for every kernel (needs `kernel-devel-<k>`).
+4. Apps: Levi prefers RPMs over Flatpak. The only Flatpak is MakeMKV (user install):
+   `flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo && flatpak install --user -y flathub com.makemkv.MakeMKV`
+5. Home: `rsync -aHAX /var/tmp/restore-staging/home/levi/ ~/`, then `system-restore --phase dconf` from GNOME, log out/in.
+6. `/etc`: for each file in `rpm-modified-files.txt` + custom units/polkit rules/NM connections/repos, **diff and show
+   Levi before copying.** Never copy `fstab`, `crypttab`, `default/grub`, `hostname`. Then `sudo restorecon -Rv /etc`.
+7. Installers, in order: `backup`, `update`, `snapshots`, `watcher`, `claude-guard` (`~/.config/<x>/install.sh`), the
+   firewall zone (`bash ~/.config/watcher/firewall-laptop-zone.sh`), then `deadman/install.sh`, `remote/install.sh`.
+8. Zed (the editor; no VS Code): `sudo dnf copr enable che/zed && sudo dnf install zed`; settings come back with home.
+9. Check: `backup status`, `watcher test --full`, `watcher check`.
